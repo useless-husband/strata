@@ -89,9 +89,9 @@ The server also serves `/-/health` (503 when fewer disks than a write needs are 
                                                                            on ≥ max(k, m+1) disks ─► visible
 ```
 
-- **Layout.** Each disk holds `buckets/<bucket>/objects/<hh>/<hash>/<version>.meta` and `<version>/part.N`. The object directory is named by a hash of the key, so S3 keys with `..`, `//` or 1,024 bytes of UTF-8 never meet the file system's rules. The shard of disk *d* is a rotation chosen from the key, so parity is spread over all disks.
+- **Layout.** Each disk holds `buckets/<bucket>/objects/<hh>/<hash>/<version>.meta` and `<version>/part.N`. The object directory is named by a hash of the key, so S3 keys with `..`, `//` or 1,024 bytes of UTF-8 never meet the file system's rules. The shard of disk *d* is a rotation chosen from the key, so parity is spread over all disks. Objects up to 128 KiB are stored inline: each disk's shard file is the payload of its metadata file, one file per object per disk.
 - **Shard files** are `[crc32c][block]` per stripe; the CRC is seeded with the stripe number and shard index, so a block that lands at the wrong offset or on the wrong disk fails too. Ranged reads touch only the blocks they need.
-- **Commit.** A new version is staged under `.strata/tmp` on every disk, synced, and renamed into place, data first and metadata last; the metadata rename is each disk's commit point. A version counts only if *k* disks hold its metadata, and a write needs max(*k*, *m*+1) disks, so a crash at any moment leaves the old version or the new one, and a deleted version can never resurface. On macOS the drive's write cache is flushed with `F_FULLFSYNC`.
+- **Commit.** A new version is staged under `.strata/tmp` on every disk, synced, and renamed into place, data first and metadata last; the metadata rename is each disk's commit point. A version counts only if *k* disks hold its metadata, and a write needs max(*k*, *m*+1) disks, so a crash at any moment leaves the old version or the new one, and a deleted version can never resurface. On macOS the drive's write cache is flushed with `F_FULLFSYNC`, once per device per commit phase and shared by concurrent commits (group commit).
 - **Reads** verify every block and, on a missing file or checksum mismatch, read other shards (data first, then parity) until they have *k*, reconstruct, and queue the object for healing. A GET keeps the version it opened alive (a lease) even if the key is overwritten mid-download.
 - **Healing** rebuilds damaged copies from any *k* intact blocks per stripe, found on any disk, and installs them with the same staging and rename protocol. Sweeps run after a wiped disk is detected; `--scrub-interval` runs periodic deep scrubs.
 - **Listing** is served from an in-memory ordered index (a one-level B+ tree) rebuilt from the metadata at start-up; delimiter listings skip each common prefix in one seek instead of walking its keys.
@@ -113,14 +113,25 @@ The server also serves `/-/health` (503 when fewer disks than a write needs are 
 
 ## Benchmarks
 
-Measured on an Apple M5 (10 cores, 16 GB) under macOS 27 with Go 1.27, **on a machine shared with other work**; all six "disks" are directories on one internal SSD, so these numbers say nothing about a multi-drive server. Method and full tables: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Measured on an Apple M5 (10 cores, 16 GB) under macOS 27 with Go 1.27, **on a machine shared with other work**; all six "disks" are directories on one internal SSD, so these numbers say nothing about a multi-drive server. Method, full tables and the measurements behind the design choices: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-Reed–Solomon, one core, 1 MiB stripes, MB/s of object data (`make bench-rs`):
+Reed–Solomon, one core, 1 MiB stripes, MB/s of object data (`make bench-rs`), with [klauspost/reedsolomon](https://github.com/klauspost/reedsolomon) measured the same way on the same machine for reference:
 
 | | 4+2 encode | 8+4 encode | 4+2 rebuild 1 data shard | 4+2 rebuild 2 | 8+4 rebuild 4 |
 |---|---:|---:|---:|---:|---:|
-| NEON TBL kernel | 23,600 | 11,500 | 46,500 | 23,200 | 11,300 |
-| portable table kernel | 2,020 | 940 | 4,090 | 2,030 | 940 |
+| strata, NEON `TBL` kernel | 23,600 | 11,500 | 46,500 | 23,200 | 11,300 |
+| strata, portable table kernel | 2,020 | 940 | 4,090 | 2,030 | 940 |
+| klauspost/reedsolomon v1.14.2, one goroutine | 10,300 | 11,100 | 15,900 | 10,100 | 11,200 |
+
+S3 over HTTP on 4+2 with `--sync full` (data on stable storage before the response), [`tools/s3bench`](tools/s3bench), client on the same host:
+
+| object size | 1 client PUT | 16 clients PUT | 1 client GET | 16 clients GET |
+|---:|---:|---:|---:|---:|
+| 4 KiB | 105/s, p50 9.1 ms | 224/s | 3,600/s, p50 275 µs | 6,400/s |
+| 1 MiB | 70 MiB/s | 109 MiB/s | 1.9 GB/s | 6.8 GB/s |
+| 64 MiB | 364 MiB/s | 819 MiB/s | 4.7 GB/s | 8.9 GB/s |
+
+Small durable writes are bound by macOS's `F_FULLFSYNC` (about 4 ms per drive-cache flush, during which APFS slows every other file operation); strata shares one flush per device among concurrent commits and stores objects up to 128 KiB inside their metadata files, which took 4 KiB PUTs from 24/s to 224/s at 16 clients. With `--sync none` they run at about 1,700/s.
 
 ## Limitations
 
@@ -129,7 +140,7 @@ Written down rather than faked:
 - **No IAM, policies, ACLs, versioning, object lock, encryption, tagging, lifecycle, website or event features.** Requests that need them get `501 NotImplemented` (only the private canned ACL is accepted). Every access key has full access.
 - **One node.** The disks are directories of one process; there is no clustering, replication between servers or rebalancing. Start-up requires every disk path to be accessible (an empty directory is treated as a replaced disk).
 - **Erasure parameters are fixed at format time**, and disks cannot be added later.
-- **The listing index lives in memory** and is rebuilt by reading every object's metadata at start-up: memory and start-up time grow with the number of objects.
+- **The listing index lives in memory** and is rebuilt from the disks at start-up (about 160 µs per object here: 20,000 objects open in 4 s): memory and start-up time grow with the number of objects.
 - **Multipart objects carry no full-object checksum** (per-part checksums are verified on upload; ETags follow S3). In-progress multipart uploads are not healed: completing one needs a write quorum of disks that still hold every part.
 - **Healing does not cover the window** in which an acknowledged write that reached exactly the write quorum is followed by a restart with one of those disks missing: until that disk returns, the previous version is served (see DESIGN).
 - **The crash test kills the process, not the machine.** It proves the commit protocol; that `F_FULLFSYNC` makes data survive power loss is Apple's guarantee, not something tested here.
@@ -137,7 +148,7 @@ Written down rather than faked:
 
 ## Related work
 
-- **[MinIO](https://github.com/minio/minio)** is the closest design: S3 API, erasure sets over drives, per-shard bitrot hashes, inline healing. It is a production system with distributed mode, IAM, versioning and much more. strata borrows the overall shape (staging + rename commits, quorum reads) and differs in details documented in DESIGN (Cauchy rather than Vandermonde-derived matrices, CRC32C with position seeding rather than HighwayHash, leases instead of re-reading metadata per block, an in-memory index for listing instead of directory walks).
+- **[MinIO](https://github.com/minio/minio)** is the closest design: S3 API, erasure sets over drives, per-shard bitrot hashes, inline healing. It is a production system with distributed mode, IAM, versioning and much more. strata borrows the overall shape (staging + rename commits, quorum reads) and differs in details documented in DESIGN (Cauchy rather than Vandermonde-derived matrices, CRC32C with position seeding rather than HighwayHash, leases instead of re-reading metadata per block, an in-memory index for listing instead of directory walks, group-committed drive flushes). Storing small objects inside their metadata follows MinIO's inline data.
 - **[klauspost/reedsolomon](https://github.com/klauspost/reedsolomon)** is the Go Reed–Solomon library MinIO uses, with AVX2/AVX-512/GFNI/NEON/SVE kernels; strata's codec is independent and simpler (one kernel shape).
 - **[Garage](https://garagehq.deuxfleurs.fr/)**, **[SeaweedFS](https://github.com/seaweedfs/seaweedfs)** and **[Ceph RGW](https://docs.ceph.com/en/latest/radosgw/)** are distributed S3-compatible stores (replication in Garage, erasure coding in SeaweedFS and Ceph).
 - **[s3proxy](https://github.com/gaul/s3proxy)** and **[versitygw](https://github.com/versity/versitygw)** translate S3 to other back ends without their own redundancy layer.
