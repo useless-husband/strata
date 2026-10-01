@@ -239,7 +239,7 @@ x-amz-date: 20130524T000000Z
 			r.Header.Del("X-Amz-Content-Sha256")
 		}, s3err.InvalidRequest},
 		{"anonymous", func(r *http.Request, v *Verifier) { r.Header.Del("Authorization") }, s3err.AccessDenied},
-		{"sigv2", func(r *http.Request, v *Verifier) { r.Header.Set("Authorization", "AWS AKID:abc") }, s3err.NotImplemented},
+		{"sigv2 garbage", func(r *http.Request, v *Verifier) { r.Header.Set("Authorization", "AWS nobody:abc") }, s3err.InvalidAccessKeyID},
 		{"garbage", func(r *http.Request, v *Verifier) {
 			r.Header.Set("Authorization", "AWS4-HMAC-SHA256 nonsense")
 		}, s3err.AuthorizationHeaderMalformed},
@@ -418,4 +418,50 @@ func FuzzChunkedReader(f *testing.F) {
 			}
 		}
 	})
+}
+
+// The Signature Version 2 examples of "Signing and Authenticating REST
+// Requests" in the Amazon S3 developer guide (bucket johnsmith).
+func TestDocumentedV2Examples(t *testing.T) {
+	v := docVerifier()
+	v.Domains = []string{"s3.amazonaws.com"}
+	v.Now = func() time.Time { return time.Date(2007, 3, 27, 19, 40, 0, 0, time.UTC) }
+	header := `GET /photos/puppy.jpg HTTP/1.1
+Host: johnsmith.s3.amazonaws.com
+Date: Tue, 27 Mar 2007 19:36:42 +0000
+Authorization: AWS AKID:bWq2s1WEIj+Ydj0vQ697zp+IXMU=
+
+`
+	r := parseRaw(t, header)
+	if sts := v.v2StringToSign(r, r.Header.Get("Date")); sts != "GET\n\n\nTue, 27 Mar 2007 19:36:42 +0000\n/johnsmith/photos/puppy.jpg" {
+		t.Fatalf("string to sign %q", sts)
+	}
+	if _, err := v.Verify(r); err != nil {
+		t.Fatalf("header example: %v", err)
+	}
+	query := `GET /photos/puppy.jpg?AWSAccessKeyId=AKID&Expires=1175139620&Signature=NpgCjnDzrM%2BWFzoENXmpNDUsSn8%3D HTTP/1.1
+Host: johnsmith.s3.amazonaws.com
+
+`
+	a, err := v.Verify(parseRaw(t, query))
+	if err != nil {
+		t.Fatalf("query example: %v", err)
+	}
+	if !a.V2 || !a.Presigned {
+		t.Fatalf("auth %+v", a)
+	}
+	v.Now = func() time.Time { return time.Unix(1175139621, 0) }
+	if _, err := v.Verify(parseRaw(t, query)); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("expired V2 URL: %v", err)
+	}
+	// Subresources are signed, other query parameters are not.
+	v.Now = func() time.Time { return time.Date(2007, 3, 27, 19, 40, 0, 0, time.UTC) }
+	r = parseRaw(t, strings.Replace(header, "puppy.jpg", "puppy.jpg?acl", 1))
+	if _, err := v.Verify(r); !errors.Is(err, s3err.SignatureDoesNotMatch) {
+		t.Fatalf("adding ?acl: %v", err)
+	}
+	r = parseRaw(t, strings.Replace(header, "puppy.jpg", "puppy.jpg?unrelated=1", 1))
+	if _, err := v.Verify(r); err != nil {
+		t.Fatalf("adding a non-subresource parameter: %v", err)
+	}
 }

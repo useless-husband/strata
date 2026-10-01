@@ -64,6 +64,7 @@ type Auth struct {
 	Scope      string
 	SigningKey []byte
 	Signature  string // seed signature: the request's own
+	V2         bool   // authenticated with Signature Version 2
 }
 
 // Verifier checks SigV4 signatures.
@@ -74,6 +75,9 @@ type Verifier struct {
 	Secret  func(accessKey string) (string, bool)
 	Now     func() time.Time // time.Now if nil
 	MaxSkew time.Duration    // DefaultMaxSkew if zero
+	// Domains of virtual-hosted-style requests; Signature Version 2 signs
+	// the bucket name even when it is in the Host header.
+	Domains []string
 }
 
 func (v *Verifier) now() time.Time {
@@ -97,12 +101,6 @@ func (v *Verifier) maxSkew() time.Duration {
 	return v.MaxSkew
 }
 
-// IsSigned reports whether the request carries any SigV4 credentials.
-func IsSigned(r *http.Request) bool {
-	return r.Header.Get("Authorization") != "" || r.URL.Query().Has("X-Amz-Algorithm") ||
-		r.URL.Query().Has("X-Amz-Credential")
-}
-
 func errMissingSignedHeader(h string) error {
 	return s3err.AccessDenied.With("There were headers present in the request which were not signed: the signed header %q is missing", h)
 }
@@ -112,15 +110,18 @@ func errMissingSignedHeader(h string) error {
 func (v *Verifier) Verify(r *http.Request) (*Auth, error) {
 	authz := r.Header.Get("Authorization")
 	q := r.URL.Query()
+	queryV2 := q.Has("Signature") || q.Has("AWSAccessKeyId")
 	switch {
-	case authz != "" && q.Has("X-Amz-Algorithm"):
+	case authz != "" && (q.Has("X-Amz-Algorithm") || queryV2):
 		return nil, s3err.InvalidArgument.With("Only one auth mechanism allowed; only the X-Amz-Algorithm query parameter, Signature query string parameter or the Authorization header should be specified")
+	case strings.HasPrefix(authz, "AWS "):
+		return v.verifyV2Header(r, authz)
 	case authz != "":
 		return v.verifyHeader(r, authz)
 	case q.Has("X-Amz-Algorithm"):
 		return v.verifyPresigned(r)
-	case q.Has("Signature") || q.Has("AWSAccessKeyId"):
-		return nil, s3err.NotImplemented.With("Signature Version 2 is not supported; use Signature Version 4")
+	case queryV2:
+		return v.verifyV2Query(r)
 	}
 	return nil, s3err.AccessDenied.With("Anonymous access is not allowed")
 }
@@ -185,9 +186,6 @@ func parseSignedHeaders(s string) ([]string, error) {
 func (v *Verifier) verifyHeader(r *http.Request, authz string) (*Auth, error) {
 	malformed := s3err.AuthorizationHeaderMalformed
 	if !strings.HasPrefix(authz, Algorithm+" ") {
-		if strings.HasPrefix(authz, "AWS ") {
-			return nil, s3err.NotImplemented.With("Signature Version 2 is not supported; use Signature Version 4")
-		}
 		return nil, s3err.AuthorizationHeaderMalformed.With("Unsupported authorization type")
 	}
 	fields := map[string]string{}

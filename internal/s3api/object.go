@@ -382,8 +382,13 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, req *request,
 		return
 	}
 	if err := o.WriteRange(r.Context(), w, off, n); err != nil {
-		if !errors.Is(err, context.Canceled) {
+		// Storage failures are S3 errors; anything else is the client
+		// going away (broken pipe, reset, cancelled context).
+		var se *s3err.Error
+		if errors.As(err, &se) {
 			s.log.Error("read failed after the response started", "id", req.id, "bucket", req.bucket, "key", req.key, "err", err)
+		} else {
+			s.log.Debug("client went away during GET", "id", req.id, "bucket", req.bucket, "key", req.key, "err", err)
 		}
 		// The status line is gone; cut the connection so the client sees
 		// a short body rather than a complete-looking wrong one.

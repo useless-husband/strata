@@ -61,7 +61,8 @@ func New(cfg Config) *Server {
 			sk, ok := cfg.Credentials[ak]
 			return sk, ok
 		},
-		Now: cfg.Now,
+		Now:     cfg.Now,
+		Domains: cfg.Domains,
 	}
 	h := sha256.Sum256([]byte("strata:" + cfg.Store.Deployment()))
 	s.hostID = hex.EncodeToString(h[:])
