@@ -313,12 +313,14 @@ func (s *Store) CompleteMultipartUpload(ctx context.Context, bucketName, key, up
 	if len(parts) == 0 {
 		return ObjectInfo{}, s3err.MalformedXML.With("You must specify at least one part")
 	}
+	for i := 1; i < len(parts); i++ {
+		if parts[i].Number <= parts[i-1].Number {
+			return ObjectInfo{}, s3err.InvalidPartOrder
+		}
+	}
 	var chosen []*partMeta
 	var size int64
 	for i, cp := range parts {
-		if i > 0 && cp.Number <= parts[i-1].Number {
-			return ObjectInfo{}, s3err.InvalidPartOrder
-		}
 		pm := up.parts[cp.Number]
 		if pm == nil || strings.Trim(cp.ETag, `"`) != pm.ETag {
 			return ObjectInfo{}, s3err.InvalidPart

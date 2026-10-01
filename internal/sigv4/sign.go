@@ -84,9 +84,15 @@ func (s *Signer) Sign(r *http.Request, payloadHash string) {
 // SignBytes signs a request whose whole body is body and attaches it.
 func (s *Signer) SignBytes(r *http.Request, body []byte) {
 	h := sha256.Sum256(body)
-	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
-	r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
+	if len(body) == 0 {
+		// A non-nil empty body would be sent with chunked transfer
+		// encoding, which S3 rejects for lack of a Content-Length.
+		r.Body, r.GetBody = http.NoBody, nil
+	} else {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
+	}
 	s.Sign(r, hex.EncodeToString(h[:]))
 }
 

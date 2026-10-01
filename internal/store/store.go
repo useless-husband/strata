@@ -150,11 +150,20 @@ func Open(cfg Config) (*Store, error) {
 
 	for i, p := range cfg.Disks {
 		d := &disk{idx: i, root: p, sync: cfg.Sync}
-		if !cfg.ReadOnly {
-			if err := d.acquireLock(); err != nil {
+		if cfg.ReadOnly {
+			if _, err := os.Stat(p); err != nil {
 				s.closeDisks()
 				return nil, err
 			}
+		}
+		// The lock is taken even read-only, so a scrub never reports the
+		// half-finished writes of a running server as damage.
+		if err := d.acquireLock(); err != nil {
+			s.closeDisks()
+			if cfg.ReadOnly {
+				return nil, fmt.Errorf("%w (to inspect a running server, use --endpoint)", err)
+			}
+			return nil, err
 		}
 		s.disks = append(s.disks, d)
 	}
