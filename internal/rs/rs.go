@@ -37,7 +37,7 @@ const chunk = 16 << 10
 
 // coef is a multiplication-by-constant in the two forms the kernels use.
 type coef struct {
-	low, high [16]byte  // NEON: c*x = low[x&15] ^ high[x>>4]
+	low, high [16]byte   // NEON: c*x = low[x&15] ^ high[x>>4]
 	full      *[256]byte // portable: c*x = full[x]
 }
 
