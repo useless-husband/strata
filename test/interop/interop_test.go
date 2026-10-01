@@ -217,10 +217,11 @@ func TestGoSDKv2(t *testing.T) {
 	if _, err := c.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
 		t.Fatal(err)
 	}
-	_, err := c.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)})
-	var owned *types.BucketAlreadyOwnedByYou
-	if !errors.As(err, &owned) {
-		t.Fatalf("second CreateBucket: %v", err)
+	// In us-east-1 (the region these tests use) S3 answers 200 to
+	// re-creating a bucket you own; other regions answer
+	// BucketAlreadyOwnedByYou.
+	if _, err := c.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+		t.Fatalf("second CreateBucket in us-east-1: %v", err)
 	}
 	if _, err := c.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String("no-such-bucket")}); httpStatus(err) != 404 {
 		t.Fatalf("HeadBucket of a missing bucket: %v", err)
