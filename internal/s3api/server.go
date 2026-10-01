@@ -171,6 +171,9 @@ func (s *Server) finish(req *request, w *statusWriter, in int64, r *http.Request
 	if s.cfg.LogRequests {
 		attrs := []any{"id", req.id, "api", req.api, "method", r.Method, "bucket", req.bucket, "key", req.key,
 			"status", w.status, "in", in, "out", w.written, "ms", float64(d.Microseconds()) / 1000, "remote", remoteIP(r)}
+		if req.auth != nil && (r.Method == http.MethodPut || r.Method == http.MethodPost) {
+			attrs = append(attrs, "payload", req.auth.Mode.String())
+		}
 		if note != "" {
 			attrs = append(attrs, "note", note)
 		}

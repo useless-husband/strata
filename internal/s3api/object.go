@@ -285,7 +285,8 @@ func setObjectHeaders(h http.Header, info store.ObjectInfo) {
 	h.Set("Content-Type", ct)
 	h.Set("Accept-Ranges", "bytes")
 	for k, v := range info.UserMeta {
-		h.Set("X-Amz-Meta-"+k, v)
+		// Lowercase, as S3 sends it: clients keep the name as received.
+		h["x-amz-meta-"+k] = []string{v}
 	}
 	for k, v := range info.Headers {
 		h.Set(k, v)

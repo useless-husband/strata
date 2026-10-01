@@ -36,6 +36,22 @@ const (
 	PayloadStreamingUnsignedTrailer
 )
 
+func (m PayloadMode) String() string {
+	switch m {
+	case PayloadSigned:
+		return "signed"
+	case PayloadUnsigned:
+		return "unsigned"
+	case PayloadStreaming:
+		return "aws-chunked-signed"
+	case PayloadStreamingTrailer:
+		return "aws-chunked-signed-trailer"
+	case PayloadStreamingUnsignedTrailer:
+		return "aws-chunked-unsigned-trailer"
+	}
+	return "unknown"
+}
+
 // Auth is the result of verifying a request.
 type Auth struct {
 	AccessKey   string
