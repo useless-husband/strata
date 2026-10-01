@@ -3,6 +3,7 @@ package sigv4
 import (
 	"bufio"
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"io"
 	"math/rand/v2"
@@ -464,4 +465,48 @@ Host: johnsmith.s3.amazonaws.com
 	if _, err := v.Verify(r); err != nil {
 		t.Fatalf("adding a non-subresource parameter: %v", err)
 	}
+}
+
+func TestPresignExpiryBounds(t *testing.T) {
+	s, v := testSigner()
+	srv := newTestServer(t, v)
+	// The test server answers 403 with the error text for any failure.
+	get := func(expires string) (int, string) {
+		req, _ := http.NewRequest("GET", srv.URL+"/bucket/key", nil)
+		resp, err := http.Get(presignWithExpires(s, req, expires))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode, string(body)
+	}
+	if code, body := get("604800"); code != 200 {
+		t.Errorf("7 days: %d %s", code, body)
+	}
+	if _, body := get("604801"); !strings.Contains(body, "AuthorizationQueryParametersError") {
+		t.Errorf("over 7 days: %s", body)
+	}
+	if _, body := get("-5"); !strings.Contains(body, "AccessDenied") || !strings.Contains(body, "expired") {
+		t.Errorf("negative expiry: %s", body)
+	}
+}
+
+// presignWithExpires presigns with a raw X-Amz-Expires value.
+func presignWithExpires(s *Signer, r *http.Request, expires string) string {
+	t := s.now()
+	date := t.Format(shortFormat)
+	sc := scope(date, s.Region, s.service())
+	q := r.URL.Query()
+	q.Set("X-Amz-Algorithm", Algorithm)
+	q.Set("X-Amz-Credential", s.AccessKey+"/"+sc)
+	q.Set("X-Amz-Date", t.Format(timeFormat))
+	q.Set("X-Amz-Expires", expires)
+	q.Set("X-Amz-SignedHeaders", "host")
+	pr := &http.Request{Method: r.Method, URL: r.URL, Host: r.URL.Host, Header: http.Header{}}
+	pr.URL.RawQuery = encodeQuery(q)
+	canonical, _ := canonicalRequest(pr, []string{"host"}, UnsignedPayload)
+	q.Set("X-Amz-Signature", hex.EncodeToString(hmacSHA256(SigningKey(s.SecretKey, date, s.Region, s.service()), stringToSign(t, sc, canonical))))
+	pr.URL.RawQuery = encodeQuery(q)
+	return pr.URL.String()
 }
