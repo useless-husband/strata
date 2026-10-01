@@ -61,3 +61,29 @@ func BenchmarkGet64MiB(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkOpen measures start-up: opening a store rebuilds the listing
+// index by reading every object's metadata header on every disk. It
+// reports the cost per object.
+func BenchmarkOpen(b *testing.B) {
+	const objects = 20000
+	ts := newTestStore(b, 4, 2)
+	ts.MakeBucket("bkt")
+	for i := 0; i < objects; i++ {
+		ts.put("bkt", fmt.Sprintf("dir%d/obj%06d", i%100, i), []byte("small object"))
+	}
+	ts.Close()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s, err := Open(ts.cfg)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if n := s.objectCount(); n != objects {
+			b.Fatalf("index has %d objects", n)
+		}
+		s.Close()
+	}
+	b.ReportMetric(float64(b.Elapsed().Microseconds())/float64(b.N)/objects, "µs/object")
+	ts.Store, _ = Open(ts.cfg) // for the cleanup's Close
+}

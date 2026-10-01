@@ -213,7 +213,12 @@ func TestCorruptMetadataIsHealed(t *testing.T) {
 	// A restart with one bad metadata copy still finds the object.
 	os.WriteFile(metaPath, []byte("garbage"), 0o644)
 	ts.reopen()
-	ts.mustGet("bkt", "k", []byte("payload"))
+	// Start-up counts copies by name and does not read them all; reads
+	// that meet the bad copy (the rotor spreads them over every disk)
+	// queue the heal.
+	for i := 0; i < 5; i++ {
+		ts.mustGet("bkt", "k", []byte("payload"))
+	}
 	ts.WaitHealIdle()
 	ts.deepClean("after restart heal")
 }

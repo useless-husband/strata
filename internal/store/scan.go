@@ -68,7 +68,7 @@ func (s *Store) scan() ([]objRef, error) {
 		wg     sync.WaitGroup
 		work   = make(chan [2]string)
 	)
-	for w := 0; w < 8; w++ {
+	for w := 0; w < scanWorkers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -96,6 +96,13 @@ func (s *Store) scan() ([]objRef, error) {
 }
 
 // scanHashDir loads the keys under objects/<hh> of a bucket.
+//
+// Version IDs are in the metadata file names, so the quorum count needs
+// only the directory listings; the metadata itself is read from one disk
+// per version (normally one version per key). Corrupt metadata copies
+// therefore count towards the quorum at start-up; reads skip them and
+// queue a heal, and a scrub finds them all. Reading every copy here would
+// make start-up cost a file read per object per disk.
 func (s *Store) scanHashDir(bucketName, hh string, cleanup bool) []objRef {
 	b := s.buckets[bucketName]
 	dirs := map[string]bool{}
@@ -107,100 +114,102 @@ func (s *Store) scanHashDir(bucketName, hh string, cleanup bool) []objRef {
 			}
 		}
 	}
+	type listing struct{ metas, dataDirs map[string]bool }
 	var toHeal []objRef
 	for h := range dirs {
-		view := make(dirView, s.n)
-		keys := map[string]bool{}
-		for i, d := range s.disks {
-			dir := d.path(bucketsDir, bucketName, objectsDir, hh, h)
-			view[i] = readDiskView(d, dir, func(m *ObjectMeta) bool {
-				return m.Bucket == bucketName && keyHash(m.Key) == h
-			})
-			for _, m := range view[i].metas {
-				keys[m.Key] = true
-			}
-		}
-		if len(keys) == 0 {
-			// Data without any metadata: the remains of a write that
-			// crashed before its first commit.
-			if cleanup {
-				for _, d := range s.disks {
-					os.RemoveAll(d.path(bucketsDir, bucketName, objectsDir, hh, h))
+		dir := func(i int) string { return s.disks[i].path(bucketsDir, bucketName, objectsDir, hh, h) }
+		ls := make([]listing, s.n)
+		count := map[string]int{}
+		for i := range s.disks {
+			ls[i] = listing{metas: map[string]bool{}, dataDirs: map[string]bool{}}
+			entries, _ := os.ReadDir(dir(i))
+			for _, e := range entries {
+				if e.IsDir() {
+					ls[i].dataDirs[e.Name()] = true
+				} else if v, ok := strings.CutSuffix(e.Name(), metaSuffix); ok {
+					ls[i].metas[v] = true
+					count[v]++
 				}
 			}
-			continue
 		}
-		referenced := map[string]bool{}
-		for key := range keys {
-			kv := make(dirView, s.n)
-			for i, dv := range view {
-				kv[i] = diskView{readable: dv.readable, corrupt: dv.corrupt, dataDirs: dv.dataDirs, metas: map[string]*ObjectMeta{}}
-				for ver, m := range dv.metas {
-					if m.Key == key {
-						kv[i].metas[ver] = m
-						referenced[ver] = true
+		// One readable copy of each version's metadata.
+		metas := map[string]*ObjectMeta{}
+		for v := range count {
+			for i := range s.disks {
+				if !ls[i].metas[v] {
+					continue
+				}
+				var m ObjectMeta
+				err := readFramedHeader(filepath.Join(dir(i), v+metaSuffix), &m)
+				if err == nil && m.VersionID == v && m.Bucket == bucketName && keyHash(m.Key) == h {
+					metas[v] = &m
+					break
+				}
+			}
+		}
+		byKey := map[string][]*ObjectMeta{}
+		for _, m := range metas {
+			byKey[m.Key] = append(byKey[m.Key], m)
+		}
+		for key, versions := range byKey {
+			var cur *ObjectMeta
+			for _, m := range versions {
+				if count[m.VersionID] >= s.k && (cur == nil || newer(m, cur)) {
+					cur = m
+				}
+			}
+			if cleanup {
+				// Keep only cur: drop versions superseded before a crash and
+				// newer ones that never reached k disks.
+				for _, m := range versions {
+					if cur != nil && m.VersionID == cur.VersionID {
+						continue
 					}
+					for i := range s.disks {
+						os.Remove(filepath.Join(dir(i), m.VersionID+metaSuffix))
+						os.RemoveAll(filepath.Join(dir(i), m.VersionID))
+						delete(ls[i].metas, m.VersionID)
+						delete(ls[i].dataDirs, m.VersionID)
+					}
+					delete(count, m.VersionID)
 				}
-			}
-			cur := kv.newestWithQuorum(s.k)
-			if cleanup {
-				s.keepOnly(kv, cur, bucketName, key)
 			}
 			if cur == nil {
 				continue
 			}
 			b.index.put(entryOf(cur))
-			if needsHeal(kv, cur) {
+			heal := false
+			for i := range s.disks {
+				if !ls[i].metas[cur.VersionID] || (!cur.Inline && !ls[i].dataDirs[cur.VersionID]) ||
+					len(ls[i].metas) > 1 || len(ls[i].dataDirs) > 1 || (cur.Inline && len(ls[i].dataDirs) > 0) {
+					heal = true
+				}
+			}
+			if heal {
 				toHeal = append(toHeal, objRef{bucketName, key})
 			}
 		}
 		if cleanup {
-			// Data directories no metadata refers to, corrupt metadata
-			// files, and directories left empty.
-			for i, d := range s.disks {
-				dir := d.path(bucketsDir, bucketName, objectsDir, hh, h)
-				for ver := range view[i].dataDirs {
-					if !referenced[ver] {
-						os.RemoveAll(filepath.Join(dir, ver))
+			// Data directories and metadata files of versions whose
+			// metadata could not be read anywhere, and empty directories.
+			for i := range s.disks {
+				for v := range ls[i].dataDirs {
+					if metas[v] == nil {
+						os.RemoveAll(filepath.Join(dir(i), v))
 					}
 				}
-				if view[i].corrupt > 0 {
-					entries, _ := os.ReadDir(dir)
-					for _, e := range entries {
-						if v, ok := strings.CutSuffix(e.Name(), metaSuffix); ok && view[i].metas[v] == nil {
-							os.Remove(filepath.Join(dir, e.Name()))
-						}
+				for v := range ls[i].metas {
+					if metas[v] == nil {
+						os.Remove(filepath.Join(dir(i), v+metaSuffix))
 					}
 				}
-				os.Remove(dir) // only if empty
+				os.Remove(dir(i)) // only if empty
 			}
 		}
 	}
 	return toHeal
 }
 
-// keepOnly removes every version of a key except cur (all of them if cur is
-// nil): versions superseded before a crash, and newer versions that never
-// reached k disks. It is only called at start-up with every disk present,
-// when no write can be in flight and no reader holds a version.
-func (s *Store) keepOnly(view dirView, cur *ObjectMeta, bucket, key string) {
-	for i, dv := range view {
-		objDir := s.disks[i].objectDir(bucket, key)
-		for ver := range dv.metas {
-			if cur == nil || ver != cur.VersionID {
-				os.Remove(filepath.Join(objDir, ver+metaSuffix))
-				os.RemoveAll(filepath.Join(objDir, ver))
-			}
-		}
-	}
-}
-
-// needsHeal reports whether some disk lacks an intact-looking copy of cur.
-func needsHeal(view dirView, cur *ObjectMeta) bool {
-	for _, dv := range view {
-		if dv.metas[cur.VersionID] == nil || (!cur.Inline && !dv.dataDirs[cur.VersionID]) || dv.corrupt > 0 {
-			return true
-		}
-	}
-	return false
-}
+// scanWorkers is the number of hash directories read in parallel at
+// start-up. More is slower on APFS, whose metadata operations contend.
+var scanWorkers = 4
