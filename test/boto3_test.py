@@ -89,9 +89,8 @@ class StrataBoto3Test(unittest.TestCase):
         with self.assertRaises(ClientError) as ctx:
             self.s3.list_objects_v2(Bucket="no-such-bucket")
         self.assertEqual(self.code(ctx), "NoSuchBucket")
-        with self.assertRaises(ClientError) as ctx:
-            self.s3.create_bucket(Bucket="boto")
-        self.assertEqual(self.code(ctx), "BucketAlreadyOwnedByYou")
+        # In us-east-1, re-creating a bucket you own succeeds, as on S3.
+        self.s3.create_bucket(Bucket="boto")
         self.s3.put_object(Bucket="boto", Key="cond", Body=b"x")
         with self.assertRaises(ClientError) as ctx:
             self.s3.get_object(Bucket="boto", Key="cond", IfMatch='"nope"')
