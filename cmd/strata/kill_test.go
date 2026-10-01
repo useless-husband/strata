@@ -266,9 +266,9 @@ func TestKillDuringUploads(t *testing.T) {
 							data[i] = byte(wr.Uint32())
 						}
 						h.mu.Lock()
-					seq := len(h.vers)
-					h.mu.Unlock()
-					copy(data, fmt.Sprintf("%s|%d|", key, seq)) // self-describing
+						seq := len(h.vers)
+						h.mu.Unlock()
+						copy(data, fmt.Sprintf("%s|%d|", key, seq)) // self-describing
 						v.sum, v.size = sha256.Sum256(data), size
 						m := md5.Sum(data)
 						v.etag = hex.EncodeToString(m[:])
