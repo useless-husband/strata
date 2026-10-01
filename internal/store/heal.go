@@ -146,6 +146,12 @@ func (s *Store) HealObject(ctx context.Context, bucketName, key string, opt Heal
 	if err != nil {
 		return res, err
 	}
+	// One heal per key at a time (a read and a sweep may both ask). This
+	// lock is separate from the object lock, so reads and writes of the
+	// key are not held up while shards are rebuilt.
+	hl := s.healLocks.get(bucketName, key)
+	hl.Lock()
+	defer hl.Unlock()
 	lk := s.locks.get(bucketName, key)
 
 	// Phase A: snapshot the index and the disks.

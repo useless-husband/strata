@@ -76,11 +76,12 @@ type Store struct {
 	mu      sync.RWMutex
 	buckets map[string]*bucket
 
-	locks   *keyLocks
-	leases  *leases
-	uploads *uploads
-	heal    *healer
-	stats   *Stats
+	locks     *keyLocks
+	healLocks *keyLocks
+	leases    *leases
+	uploads   *uploads
+	heal      *healer
+	stats     *Stats
 
 	lastDiskCheck atomic.Int64
 	diskCheckMu   sync.Mutex
@@ -139,7 +140,7 @@ func Open(cfg Config) (*Store, error) {
 		n: n, k: cfg.DataShards, m: cfg.ParityShards,
 		geo:     geometry{k: cfg.DataShards, blockSize: int64(cfg.BlockSize)},
 		buckets: map[string]*bucket{},
-		locks:   newKeyLocks(), leases: newLeases(), uploads: newUploads(),
+		locks:   newKeyLocks(), healLocks: newKeyLocks(), leases: newLeases(), uploads: newUploads(),
 		stats: newStats(n),
 		ctx:   ctx, cancel: cancel,
 	}
