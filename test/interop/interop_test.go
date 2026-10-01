@@ -87,7 +87,11 @@ func TestMain(m *testing.M) {
 	bin := os.Getenv("STRATA_BIN")
 	if bin == "" {
 		bin = filepath.Join(dir, "strata")
-		if out, err := exec.Command("go", "build", "-o", bin, "../../cmd/strata").CombinedOutput(); err != nil {
+		// Built from the main module's root: this test module does not
+		// contain cmd/strata.
+		build := exec.Command("go", "build", "-o", bin, "./cmd/strata")
+		build.Dir = filepath.Join("..", "..")
+		if out, err := build.CombinedOutput(); err != nil {
 			fmt.Fprintf(os.Stderr, "building strata: %v\n%s", err, out)
 			os.Exit(1)
 		}
