@@ -74,7 +74,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3 sync ~/Pictures s3://photos/
 | `strata scrub` | Read and verify every block; repair nothing; exit status 1 if anything is damaged. |
 | `strata info` | Layout, object counts, integrity counters and disk space. |
 
-The server also serves `/-/health` (503 when fewer disks than a write needs are online) and Prometheus metrics at `/-/metrics`: requests and latency histograms per S3 API, bytes in and out, corrupt blocks, missing shards, degraded stripes, healed and lost objects, scrub progress, per-disk state and free space.
+The server also serves, without authentication, `/-/health` (503 when fewer disks than a write needs are online) and Prometheus metrics at `/-/metrics`: requests and latency histograms per S3 API, bytes in and out, corrupt blocks, missing shards, degraded stripes, healed and lost objects, scrub progress, per-disk state and free space.
 
 ## How it works
 
@@ -142,19 +142,19 @@ Written down rather than faked:
 - **One node.** The disks are directories of one process; there is no clustering, replication between servers or rebalancing. Start-up requires every disk path to be accessible (an empty directory is treated as a replaced disk).
 - **Erasure parameters are fixed at format time**, and disks cannot be added later.
 - **The listing index lives in memory** and is rebuilt from the disks at start-up (about 160 µs per object here: 20,000 objects open in 4 s): memory and start-up time grow with the number of objects.
-- **Multipart objects carry no full-object checksum** (per-part checksums are verified on upload; ETags follow S3). In-progress multipart uploads are not healed: completing one needs a write quorum of disks that still hold every part.
+- **In-progress multipart uploads are not healed**: completing one needs a write quorum of disks that still hold every part. Completion retries are recognised only until a restart.
 - **Healing does not cover the window** in which an acknowledged write that reached exactly the write quorum is followed by a restart with one of those disks missing: until that disk returns, the previous version is served (see DESIGN).
 - **The crash test kills the process, not the machine.** It proves the commit protocol; that `F_FULLFSYNC` makes data survive power loss is Apple's guarantee, not something tested here.
 - Signature Version 4A, SSE-C, POST policy uploads and SelectObjectContent are not implemented.
 
 ## Related work
 
-- **[MinIO](https://github.com/minio/minio)** is the closest design: S3 API, erasure sets over drives, per-shard bitrot hashes, inline healing. It is a production system with distributed mode, IAM, versioning and much more. strata borrows the overall shape (staging + rename commits, quorum reads) and differs in details documented in DESIGN (Cauchy rather than Vandermonde-derived matrices, CRC32C with position seeding rather than HighwayHash, leases instead of re-reading metadata per block, an in-memory index for listing instead of directory walks, group-committed drive flushes). Storing small objects inside their metadata follows MinIO's inline data.
+- **[MinIO](https://github.com/minio/minio)** is the closest design: S3 API, erasure sets over drives, per-shard bitrot hashes, inline healing. It is a production system with distributed mode, IAM, versioning and much more. strata borrows the overall shape (staging + rename commits, quorum reads) and differs in details documented in DESIGN (Cauchy rather than Vandermonde-derived matrices, CRC32C with position seeding rather than HighwayHash, immutable per-version metadata files rather than one rewritten `xl.meta`, an in-memory index for listing instead of directory walks, group-committed drive flushes). Storing small objects inside their metadata follows MinIO's inline data.
 - **[klauspost/reedsolomon](https://github.com/klauspost/reedsolomon)** is the Go Reed–Solomon library MinIO uses, with AVX2/AVX-512/GFNI/NEON/SVE kernels; strata's codec is independent and simpler (one kernel shape).
 - **[Garage](https://garagehq.deuxfleurs.fr/)**, **[SeaweedFS](https://github.com/seaweedfs/seaweedfs)** and **[Ceph RGW](https://docs.ceph.com/en/latest/radosgw/)** are distributed S3-compatible stores (replication in Garage, erasure coding in SeaweedFS and Ceph).
 - **[s3proxy](https://github.com/gaul/s3proxy)** and **[versitygw](https://github.com/versity/versitygw)** translate S3 to other back ends without their own redundancy layer.
 
-strata is a single-binary study of the core mechanisms, small enough to read (about 9,000 lines of non-test Go, comments included), with each correctness claim tied to a test.
+strata is a single-binary study of the core mechanisms, small enough to read (about 10,600 lines of non-test Go, comments included, and 5,000 of tests), with each correctness claim tied to a test.
 
 ## Build and test
 
