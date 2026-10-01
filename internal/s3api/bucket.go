@@ -104,12 +104,10 @@ func (s *Server) getBucketVersioning(w http.ResponseWriter, r *http.Request, req
 // full control.
 func (s *Server) getACL(w http.ResponseWriter, r *http.Request, req *request) {
 	if req.key != "" {
-		o, err := s.store.OpenObject(req.bucket, req.key)
-		if err != nil {
+		if _, err := s.store.StatObject(req.bucket, req.key); err != nil {
 			s.writeError(w, r, req, err)
 			return
 		}
-		o.Close()
 	} else if _, err := s.store.HeadBucket(req.bucket); err != nil {
 		s.writeError(w, r, req, err)
 		return

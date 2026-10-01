@@ -14,6 +14,11 @@ type entry struct {
 	size      int64
 	etag      string
 	modTime   int64
+	inline    bool
+}
+
+func entryOf(m *ObjectMeta) entry {
+	return entry{key: m.Key, versionID: m.VersionID, size: m.Size, etag: m.ETag, modTime: m.ModTime, inline: m.Inline}
 }
 
 // index is an ordered map from key to entry for one bucket: a sorted list of

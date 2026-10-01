@@ -150,6 +150,8 @@ func (s *Server) writeMetrics(w io.Writer) {
 	p.single("strata_healed_shards_total", "counter", "Shard copies rewritten by healing.", float64(st.HealedShards))
 	p.single("strata_lost_objects_total", "counter", "Heals that found too few intact shards (data loss).", float64(st.LostObjects))
 	p.single("strata_disks_replaced_total", "counter", "Disks found wiped or replaced and reformatted.", float64(st.DisksReplaced))
+	p.single("strata_sync_flush_requests_total", "counter", "Commit points that waited for a drive-cache flush (macOS, --sync full).", float64(st.SyncRequests))
+	p.single("strata_sync_flushes_total", "counter", "F_FULLFSYNC drive-cache flushes issued for them (group commit).", float64(st.SyncFlushes))
 	p.single("strata_heal_queue_length", "gauge", "Objects waiting to be healed.", float64(st.HealQueue))
 	p.single("strata_scrubs_total", "counter", "Deep scrubs started.", float64(st.Scrubs))
 	p.single("strata_scrubbed_objects_total", "counter", "Objects verified by deep scrubs.", float64(st.ScrubbedObjects))

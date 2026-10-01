@@ -310,13 +310,20 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, req *request,
 		s.writeError(w, r, req, s3err.InvalidArgument.With("Invalid version id specified"))
 		return
 	}
-	o, err := s.store.OpenObject(req.bucket, req.key)
+	// HEAD needs only the metadata; GET also loads small objects' data.
+	var o *store.Object
+	var info store.ObjectInfo
+	var err error
+	if head {
+		info, err = s.store.StatObject(req.bucket, req.key)
+	} else if o, err = s.store.OpenObject(req.bucket, req.key); err == nil {
+		defer o.Close()
+		info = o.Info
+	}
 	if err != nil {
 		s.writeError(w, r, req, err)
 		return
 	}
-	defer o.Close()
-	info := o.Info
 	h := w.Header()
 	if err := checkPreconditions(r.Header, info, true); err != nil {
 		if errors.Is(err, s3err.NotModified) {

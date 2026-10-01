@@ -258,14 +258,25 @@ func TestRangedReads(t *testing.T) {
 func TestOverwriteAndDelete(t *testing.T) {
 	ts := newTestStore(t, 2, 1)
 	ts.MakeBucket("bkt")
+	big := bytes.Repeat([]byte("big"), 100_000)
 	ts.put("bkt", "k", []byte("one"))
-	ts.put("bkt", "k", []byte("second version"))
-	ts.mustGet("bkt", "k", []byte("second version"))
-	// Exactly one version is left on each disk.
+	ts.put("bkt", "k", big)
+	ts.mustGet("bkt", "k", big)
+	// Exactly one version is left on each disk: <version>.meta and the
+	// <version>/ data directory.
 	for _, d := range ts.Store.disks {
 		entries, _ := os.ReadDir(d.objectDir("bkt", "k"))
-		if len(entries) != 2 { // <version>.meta and <version>/
+		if len(entries) != 2 {
 			t.Fatalf("%s holds %d entries for the key, want 2", d, len(entries))
+		}
+	}
+	// A small object is inline: only <version>.meta.
+	ts.put("bkt", "k", []byte("second version"))
+	ts.mustGet("bkt", "k", []byte("second version"))
+	for _, d := range ts.Store.disks {
+		entries, _ := os.ReadDir(d.objectDir("bkt", "k"))
+		if len(entries) != 1 {
+			t.Fatalf("%s holds %d entries for the inline key, want 1", d, len(entries))
 		}
 	}
 	if err := ts.DeleteObject("bkt", "k"); err != nil {

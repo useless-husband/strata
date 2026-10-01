@@ -89,6 +89,9 @@ type disk struct {
 	sync   SyncMode
 	lock   *os.File
 	online atomic.Bool
+	// barrier is the shared drive-cache flush of this disk's device, with
+	// SyncFull on macOS; nil otherwise.
+	barrier *barrier
 	// errors counts I/O errors other than "not found", for metrics.
 	errors atomic.Int64
 }
@@ -133,19 +136,45 @@ func (d *disk) noteErr(err error) error {
 	return err
 }
 
-// syncFile applies the disk's sync mode to an open file.
-func (d *disk) syncFile(f *os.File) error {
+// Durability is built from two operations. push moves a file's data and
+// metadata (or a directory's entries) out of the page cache: fsync(2).
+// flush makes everything pushed so far durable: on macOS with SyncFull
+// that is the device's shared F_FULLFSYNC barrier (barrier.go); elsewhere
+// push is already durable and flush does nothing. Commit points push
+// every file on every disk, then flush each device once.
+
+// push applies the disk's sync mode to an open file, up to the flush.
+func (d *disk) push(f *os.File) error {
 	switch d.sync {
-	case SyncFull:
-		return fullSync(f)
+	case SyncNone:
+		return nil
 	case SyncFsync:
 		return plainSync(f)
+	}
+	if d.barrier != nil {
+		return plainSync(f)
+	}
+	return fullSync(f)
+}
+
+// flush makes every push before it durable.
+func (d *disk) flush() error {
+	if d.barrier != nil {
+		return d.barrier.wait()
 	}
 	return nil
 }
 
-// syncDir makes a directory's entries (creations, renames) durable.
-func (d *disk) syncDir(dir string) error {
+// syncFile makes one file durable on its own.
+func (d *disk) syncFile(f *os.File) error {
+	if err := d.push(f); err != nil {
+		return err
+	}
+	return d.flush()
+}
+
+// pushDir pushes a directory's entries (creations, renames).
+func (d *disk) pushDir(dir string) error {
 	if d.sync == SyncNone {
 		return nil
 	}
@@ -154,43 +183,64 @@ func (d *disk) syncDir(dir string) error {
 		return err
 	}
 	defer f.Close()
-	err = d.syncFile(f)
+	err = d.push(f)
 	if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) {
 		return nil // some file systems cannot sync directories
 	}
 	return err
 }
 
-// mkdirAll creates dir and any missing parents, syncing each parent whose
-// entries changed so the new directories survive a crash.
-func (d *disk) mkdirAll(dir string) error {
+// syncDir makes a directory's entries durable on their own.
+func (d *disk) syncDir(dir string) error {
+	if err := d.pushDir(dir); err != nil {
+		return err
+	}
+	return d.flush()
+}
+
+// mkdirAllPushed creates dir and any missing parents, pushing each parent
+// whose entries changed. It reports whether it created anything.
+func (d *disk) mkdirAllPushed(dir string) (bool, error) {
 	if _, err := os.Stat(dir); err == nil {
-		return nil
+		return false, nil
 	}
 	parent := filepath.Dir(dir)
 	if parent != dir {
-		if err := d.mkdirAll(parent); err != nil {
-			return err
+		if _, err := d.mkdirAllPushed(parent); err != nil {
+			return false, err
 		}
 	}
 	if err := os.Mkdir(dir, 0o755); err != nil {
 		if errors.Is(err, fs.ErrExist) {
-			return nil
+			return false, nil
 		}
+		return false, err
+	}
+	return true, d.pushDir(parent)
+}
+
+// mkdirAll creates dir and any missing parents durably.
+func (d *disk) mkdirAll(dir string) error {
+	created, err := d.mkdirAllPushed(dir)
+	if err != nil || !created {
 		return err
 	}
-	return d.syncDir(parent)
+	return d.flush()
 }
 
 // writeFileAtomic writes data to path so that a crash leaves either the old
-// file or the complete new one: write to a temporary file, sync it, rename
-// it into place and sync the directory.
+// file or the complete new one: write a temporary file, make it durable,
+// rename it into place and make the rename durable.
 func (d *disk) writeFileAtomic(path string, data []byte) error {
 	tmp := d.sysPath(tmpDir, newID())
-	if err := d.writeFileSynced(tmp, data); err != nil {
+	if err := d.writeFilePushed(tmp, data); err != nil {
 		return err
 	}
-	if err := d.mkdirAll(filepath.Dir(path)); err != nil {
+	if _, err := d.mkdirAllPushed(filepath.Dir(path)); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := d.flush(); err != nil {
 		os.Remove(tmp)
 		return err
 	}
@@ -201,8 +251,8 @@ func (d *disk) writeFileAtomic(path string, data []byte) error {
 	return d.syncDir(filepath.Dir(path))
 }
 
-// writeFileSynced creates path with data and syncs it.
-func (d *disk) writeFileSynced(path string, data []byte) error {
+// writeFilePushed creates path with data and pushes it.
+func (d *disk) writeFilePushed(path string, data []byte) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
@@ -212,7 +262,7 @@ func (d *disk) writeFileSynced(path string, data []byte) error {
 		os.Remove(path)
 		return err
 	}
-	if err := d.syncFile(f); err != nil {
+	if err := d.push(f); err != nil {
 		f.Close()
 		os.Remove(path)
 		return err

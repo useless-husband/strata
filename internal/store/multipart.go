@@ -201,28 +201,32 @@ func (s *Store) PutObjectPart(ctx context.Context, bucket, key, uploadID string,
 	if up.done {
 		return PartInfo{}, s3err.NoSuchUpload
 	}
+	// Two durable steps, as in publish: the shard file under its final
+	// name and the new part metadata under a temporary name, then the
+	// rename of the metadata over the previous one.
 	name := "part." + strconv.Itoa(n)
-	var wg sync.WaitGroup
-	for d := range s.disks {
-		if !st.alive[d] {
-			continue
+	s.forStage(st, func(d int) error {
+		dk := s.disks[d]
+		dir := dk.uploadDir(uploadID)
+		if err := os.Rename(st.dir(d, "data", name), filepath.Join(dir, pm.File)); err != nil {
+			return err
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			dk := s.disks[d]
-			dir := dk.uploadDir(uploadID)
-			if err := os.Rename(st.dir(d, "data", name), filepath.Join(dir, pm.File)); err != nil {
-				st.fail(d, err)
-				return
-			}
-			if err := dk.writeFileAtomic(filepath.Join(dir, name+metaSuffix), data); err != nil {
-				os.Remove(filepath.Join(dir, pm.File))
-				st.fail(d, err)
-			}
-		}()
-	}
-	wg.Wait()
+		if err := dk.writeFilePushed(st.dir(d, "partmeta"), data); err != nil {
+			return err
+		}
+		return dk.pushDir(dir)
+	})
+	s.flushStage(st)
+	s.forStage(st, func(d int) error {
+		dk := s.disks[d]
+		dir := dk.uploadDir(uploadID)
+		if err := os.Rename(st.dir(d, "partmeta"), filepath.Join(dir, name+metaSuffix)); err != nil {
+			os.Remove(filepath.Join(dir, pm.File))
+			return err
+		}
+		return dk.pushDir(dir)
+	})
+	s.flushStage(st)
 	if ok := st.count(); ok < s.writeQuorum {
 		// Disks that took the new part keep it; on the others the old part
 		// (if any) is still current. Completion will only use disks that

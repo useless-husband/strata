@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"os"
 )
 
 // A shard file holds one shard of every stripe of a part:
@@ -74,7 +73,7 @@ func (g geometry) shardFileSize(size int64) int64 {
 
 // readBlock reads and verifies the block of stripe s from a shard file. buf
 // must have room for crcSize+n bytes; the returned slice aliases it.
-func readBlock(f *os.File, g geometry, s int64, shard int, n int64, buf []byte) ([]byte, error) {
+func readBlock(f io.ReaderAt, g geometry, s int64, shard int, n int64, buf []byte) ([]byte, error) {
 	buf = buf[:crcSize+n]
 	if _, err := f.ReadAt(buf, g.blockOffset(s)); err != nil {
 		if errors.Is(err, io.EOF) {

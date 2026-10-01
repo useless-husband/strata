@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -59,7 +60,7 @@ func readDiskView(d *disk, dir string, accept func(*ObjectMeta) bool) diskView {
 			continue
 		}
 		var m ObjectMeta
-		if err := readFramed(filepath.Join(dir, name), &m); err != nil || m.VersionID != version || !accept(&m) {
+		if err := readFramedHeader(filepath.Join(dir, name), &m); err != nil || m.VersionID != version || !accept(&m) {
 			dv.corrupt++
 			continue
 		}
@@ -201,10 +202,13 @@ func (s *Store) HealObject(ctx context.Context, bucketName, key string, opt Heal
 	}
 	var st *stage
 	if anyBad {
-		st = &stage{s: s, id: newID(), alive: make([]bool, s.n)}
+		st = &stage{s: s, id: newID(), alive: make([]bool, s.n), inline: meta.Inline}
+		if meta.Inline {
+			st.payload = make([][]byte, s.n)
+		}
 		defer st.discard()
 		for d := range bad {
-			if bad[d] && os.MkdirAll(st.dir(d, "data"), 0o755) == nil {
+			if bad[d] && (meta.Inline || os.MkdirAll(st.dir(d, "data"), 0o755) == nil) {
 				st.alive[d] = true
 			}
 		}
@@ -245,10 +249,8 @@ func (s *Store) HealObject(ctx context.Context, bucketName, key string, opt Heal
 			objDir := dk.objectDir(bucketName, key)
 			removeIfExists(filepath.Join(objDir, meta.VersionID+metaSuffix))
 			dk.removeAll(filepath.Join(objDir, meta.VersionID))
-			if err := s.publishOne(st, d, meta); err != nil {
-				st.fail(d, err)
-			}
 		}
+		s.publish(st, meta)
 		if st.count() > 0 {
 			res.Healed = true
 			s.stats.healedObjects.Add(1)
@@ -256,7 +258,7 @@ func (s *Store) HealObject(ctx context.Context, bucketName, key string, opt Heal
 		}
 	}
 	if res.Promoted {
-		b.index.put(entry{key: key, versionID: meta.VersionID, size: meta.Size, etag: meta.ETag, modTime: meta.ModTime})
+		b.index.put(entryOf(meta))
 	}
 	for _, sv := range stale {
 		if s.leases.busy(sv.version) {
@@ -301,33 +303,58 @@ func (s *Store) staleVersions(view dirView, cur *ObjectMeta) []staleVersion {
 	return out
 }
 
-// copyIntact checks disk d's copy of a version.
+// openShard opens disk d's shard file of one part of a version: a file in
+// the version's data directory, or the payload of the metadata file of an
+// inline object. It returns the file and its size.
+func (s *Store) openShard(d int, meta *ObjectMeta, part int) (shardSource, int64, error) {
+	dk := s.disks[d]
+	objDir := dk.objectDir(meta.Bucket, meta.Key)
+	if meta.Inline {
+		var m ObjectMeta
+		p, err := readFramedPayload(filepath.Join(objDir, meta.VersionID+metaSuffix), &m)
+		if err != nil {
+			return nil, 0, err
+		}
+		if m.VersionID != meta.VersionID {
+			return nil, 0, errCorruptMeta
+		}
+		return inlineShard{bytes.NewReader(p)}, int64(len(p)), nil
+	}
+	f, err := os.Open(filepath.Join(objDir, meta.VersionID, "part."+strconv.Itoa(part)))
+	if err != nil {
+		return nil, 0, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, 0, err
+	}
+	return f, fi.Size(), nil
+}
+
+// copyIntact checks disk d's copy of a version: metadata present, shard
+// files of the right size, and with deep set, every block's checksum.
 func (s *Store) copyIntact(ctx context.Context, d int, meta *ObjectMeta, hasMeta, deep bool, res *HealResult) bool {
 	if !hasMeta {
 		return false
 	}
-	dk := s.disks[d]
 	geo := geometry{k: meta.Erasure.Data, blockSize: int64(meta.Erasure.BlockSize)}
 	shard := meta.Erasure.Distribution[d]
-	dir := filepath.Join(dk.objectDir(meta.Bucket, meta.Key), meta.VersionID)
 	var buf []byte
 	for _, p := range meta.Parts {
-		path := filepath.Join(dir, "part."+strconv.Itoa(p.Number))
-		fi, err := os.Stat(path)
-		if err != nil || fi.Size() != geo.shardFileSize(p.Size) {
-			if err == nil {
-				s.stats.corruptBlocks.Add(1)
-			} else {
-				s.stats.missingShards.Add(1)
-			}
+		f, size, err := s.openShard(d, meta, p.Number)
+		if err != nil {
+			s.stats.missingShards.Add(1)
+			return false
+		}
+		if size != geo.shardFileSize(p.Size) {
+			f.Close()
+			s.stats.corruptBlocks.Add(1)
 			return false
 		}
 		if !deep {
+			f.Close()
 			continue
-		}
-		f, err := os.Open(path)
-		if err != nil {
-			return false
 		}
 		if buf == nil {
 			buf = make([]byte, crcSize+geo.shardLen(geo.blockSize))
@@ -350,7 +377,8 @@ func (s *Store) copyIntact(ctx context.Context, d int, meta *ObjectMeta, hasMeta
 	return true
 }
 
-// rebuild writes complete shard files for the stage's disks, reconstructing
+// rebuild writes complete shard files for the stage's disks (into its
+// data directories, or its payloads for an inline object), reconstructing
 // each stripe from any k intact blocks found on any disk. It reports lost
 // if some stripe has fewer than k.
 func (s *Store) rebuild(ctx context.Context, meta *ObjectMeta, st *stage, res *HealResult) (lost bool, err error) {
@@ -358,7 +386,6 @@ func (s *Store) rebuild(ctx context.Context, meta *ObjectMeta, st *stage, res *H
 	k := meta.Erasure.Data
 	geo := geometry{k: k, blockSize: int64(meta.Erasure.BlockSize)}
 	codec := s.codecFor(meta)
-	dir := func(d int) string { return filepath.Join(s.disks[d].objectDir(meta.Bucket, meta.Key), meta.VersionID) }
 	bufs := make([][]byte, n)  // read buffers: crc + block
 	recon := make([][]byte, n) // reconstruction outputs
 	shards := make([][]byte, n)
@@ -369,7 +396,7 @@ func (s *Store) rebuild(ctx context.Context, meta *ObjectMeta, st *stage, res *H
 	var out []byte
 	for _, p := range meta.Parts {
 		name := "part." + strconv.Itoa(p.Number)
-		in := make([]*os.File, n)
+		in := make([]shardSource, n)
 		outs := make([]*os.File, n)
 		closeAll := func() {
 			for i := range in {
@@ -383,9 +410,9 @@ func (s *Store) rebuild(ctx context.Context, meta *ObjectMeta, st *stage, res *H
 		}
 		for d := 0; d < n; d++ {
 			if s.disks[d].online.Load() {
-				in[d], _ = os.Open(filepath.Join(dir(d), name)) // may be missing
+				in[d], _, _ = s.openShard(d, meta, p.Number) // may be missing
 			}
-			if st.alive[d] {
+			if st.alive[d] && !st.inline {
 				f, err := os.OpenFile(st.dir(d, "data", name), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 				if err != nil {
 					st.fail(d, err)
@@ -404,32 +431,18 @@ func (s *Store) rebuild(ctx context.Context, meta *ObjectMeta, st *stage, res *H
 			for i := range shards {
 				shards[i] = nil
 			}
-			for d := 0; d < n; d++ {
-				idx := meta.Erasure.Distribution[d]
-				if in[d] == nil || st.alive[d] {
-					// Never trust a copy that is being replaced, even
-					// blocks of it that verify: it might be a shard file
-					// of the wrong length or layout.
-					continue
-				}
-				data, err := readBlock(in[d], geo, stripe, idx, sl, bufs[idx])
-				if err != nil {
-					continue
-				}
-				shards[idx] = data
-				have++
-				res.BytesRead += crcSize + sl
-			}
-			if have < k {
-				// Fall back to blocks from the copies being replaced.
-				for d := 0; d < n && have < k; d++ {
+			// Prefer the copies that are not being replaced; fall back to
+			// blocks of the replaced ones that still verify.
+			for pass := 0; pass < 2 && have < k; pass++ {
+				for d := 0; d < n && (pass == 0 || have < k); d++ {
 					idx := meta.Erasure.Distribution[d]
-					if in[d] == nil || shards[idx] != nil {
+					if in[d] == nil || shards[idx] != nil || (pass == 0) == st.alive[d] {
 						continue
 					}
 					if data, err := readBlock(in[d], geo, stripe, idx, sl, bufs[idx]); err == nil {
 						shards[idx] = data
 						have++
+						res.BytesRead += crcSize + sl
 					}
 				}
 			}
@@ -447,10 +460,17 @@ func (s *Store) rebuild(ctx context.Context, meta *ObjectMeta, st *stage, res *H
 				return false, err
 			}
 			for d := 0; d < n; d++ {
-				if outs[d] == nil || !st.alive[d] {
+				if !st.alive[d] {
 					continue
 				}
 				idx := meta.Erasure.Distribution[d]
+				if st.inline {
+					st.payload[d] = appendBlock(st.payload[d], stripe, idx, shards[idx])
+					continue
+				}
+				if outs[d] == nil {
+					continue
+				}
 				out = appendBlock(out[:0], stripe, idx, shards[idx])
 				if _, err := outs[d].Write(out); err != nil {
 					st.fail(d, err)
@@ -459,7 +479,7 @@ func (s *Store) rebuild(ctx context.Context, meta *ObjectMeta, st *stage, res *H
 		}
 		for d := 0; d < n; d++ {
 			if outs[d] != nil && st.alive[d] {
-				if err := s.disks[d].syncFile(outs[d]); err != nil {
+				if err := s.disks[d].push(outs[d]); err != nil {
 					st.fail(d, err)
 				}
 			}

@@ -149,7 +149,7 @@ func (s *Store) scanHashDir(bucketName, hh string, cleanup bool) []objRef {
 			if cur == nil {
 				continue
 			}
-			b.index.put(entry{key: key, versionID: cur.VersionID, size: cur.Size, etag: cur.ETag, modTime: cur.ModTime})
+			b.index.put(entryOf(cur))
 			if needsHeal(kv, cur) {
 				toHeal = append(toHeal, objRef{bucketName, key})
 			}
@@ -198,7 +198,7 @@ func (s *Store) keepOnly(view dirView, cur *ObjectMeta, bucket, key string) {
 // needsHeal reports whether some disk lacks an intact-looking copy of cur.
 func needsHeal(view dirView, cur *ObjectMeta) bool {
 	for _, dv := range view {
-		if dv.metas[cur.VersionID] == nil || !dv.dataDirs[cur.VersionID] || dv.corrupt > 0 {
+		if dv.metas[cur.VersionID] == nil || (!cur.Inline && !dv.dataDirs[cur.VersionID]) || dv.corrupt > 0 {
 			return true
 		}
 	}

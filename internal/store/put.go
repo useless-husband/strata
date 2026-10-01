@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -82,12 +83,16 @@ type PutOptions struct {
 	Precommit func(md5sum []byte) (Checksum, error)
 }
 
-// stage is an object version or part being written to every disk, under
-// <disk>/.strata/tmp/<id>/.
+// stage is an object version or part being written to every disk. A
+// regular stage writes shard files under <disk>/.strata/tmp/<id>/data/; an
+// inline stage (small objects) keeps each disk's shard file in memory and
+// writes it as the payload of that disk's metadata file.
 type stage struct {
-	s     *Store
-	id    string
-	alive []bool
+	s       *Store
+	id      string
+	alive   []bool
+	inline  bool
+	payload [][]byte // inline shard file of each disk
 }
 
 func (s *Store) newStage() *stage {
@@ -105,8 +110,24 @@ func (s *Store) newStage() *stage {
 	return st
 }
 
+func (s *Store) newInlineStage() *stage {
+	st := &stage{s: s, id: newID(), alive: make([]bool, s.n), inline: true, payload: make([][]byte, s.n)}
+	for i, d := range s.disks {
+		st.alive[i] = d.online.Load()
+	}
+	return st
+}
+
 func (st *stage) dir(d int, elem ...string) string {
 	return st.s.disks[d].sysPath(append([]string{tmpDir, st.id}, elem...)...)
+}
+
+// metaTmp is where disk d's metadata is written before the commit rename.
+func (st *stage) metaTmp(d int) string {
+	if st.inline {
+		return st.s.disks[d].sysPath(tmpDir, st.id+metaSuffix)
+	}
+	return st.dir(d, "meta")
 }
 
 func (st *stage) count() int {
@@ -128,13 +149,45 @@ func (st *stage) fail(d int, err error) {
 	}
 }
 
-// discard removes the staging directories.
+// discard removes what is left of the stage.
 func (st *stage) discard() {
 	for i, d := range st.s.disks {
-		if d.online.Load() {
+		if !d.online.Load() {
+			continue
+		}
+		if st.inline {
+			os.Remove(st.metaTmp(i))
+		} else {
 			os.RemoveAll(st.dir(i))
 		}
 	}
+}
+
+// defaultInlineLimit is the largest object stored inline by default
+// (Config.InlineLimit). Each disk then holds
+// one file per object instead of a metadata file, a directory and a shard
+// file, which matters because creating, renaming and deleting files is
+// what small-object writes spend their time on (on APFS every such
+// operation also waits for any F_FULLFSYNC in flight; see BENCHMARKS).
+const (
+	defaultInlineLimit = 128 << 10
+	maxInlineLimit     = 1 << 20
+)
+
+// encodeInline erasure-codes a small object into the stage's in-memory
+// shard files and returns its MD5.
+func (s *Store) encodeInline(st *stage, data []byte, dist []int) []byte {
+	sum := md5.Sum(data)
+	shards := make([][]byte, s.n)
+	for stripe, off := int64(0), 0; off < len(data); stripe, off = stripe+1, off+s.cfg.BlockSize {
+		shards = s.codec.Split(data[off:min(off+s.cfg.BlockSize, len(data))], shards)
+		s.codec.Encode(shards)
+		for d := range s.disks {
+			idx := dist[d]
+			st.payload[d] = appendBlock(st.payload[d], stripe, idx, shards[idx])
+		}
+	}
+	return sum[:]
 }
 
 var bufPool sync.Pool // *[]byte of blockSize
@@ -219,27 +272,14 @@ func (s *Store) writePart(ctx context.Context, st *stage, number int, body io.Re
 			return 0, nil, rerr
 		}
 	}
-	// Push the shard data to the drives. With SyncFull the drive cache is
-	// flushed by the full sync of the metadata file, which comes next and
-	// precedes the commit.
-	var wg sync.WaitGroup
-	errs := make([]error, s.n)
-	for d, f := range files {
-		if f == nil || !st.alive[d] || s.cfg.Sync == SyncNone {
-			continue
+	// Push the shard data to the drives; the flush before the commit
+	// renames makes it durable.
+	s.forStage(st, func(d int) error {
+		if files[d] == nil {
+			return nil
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			errs[d] = plainSync(f)
-		}()
-	}
-	wg.Wait()
-	for d, err := range errs {
-		if err != nil {
-			st.fail(d, err)
-		}
-	}
+		return s.disks[d].push(files[d])
+	})
 	if st.count() < s.writeQuorum {
 		return 0, nil, errWriteQuorum(st.count(), s.writeQuorum)
 	}
@@ -260,18 +300,39 @@ func (s *Store) PutObject(ctx context.Context, bucketName, key string, body io.R
 	if cur, ok := b.index.get(key); opts.Conditions.check(cur, ok) != nil {
 		return ObjectInfo{}, opts.Conditions.check(cur, ok)
 	}
-	st := s.newStage()
-	defer st.discard()
 	dist := distribution(key, s.n)
-	size, sum, err := s.writePart(ctx, st, 1, body, dist, MaxPutSize)
-	if err != nil {
+	// Read up to the inline limit: a body that ends there is stored inline,
+	// a longer one is streamed.
+	limit := max(s.cfg.InlineLimit, -1)
+	head := make([]byte, limit+1)
+	n, err := io.ReadFull(body, head)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 		return ObjectInfo{}, err
 	}
+	var st *stage
+	var size int64
+	var sum []byte
+	if n <= limit {
+		st = s.newInlineStage()
+		if st.count() < s.writeQuorum {
+			return ObjectInfo{}, errWriteQuorum(st.count(), s.writeQuorum)
+		}
+		size, sum = int64(n), s.encodeInline(st, head[:n], dist)
+	} else {
+		st = s.newStage()
+		size, sum, err = s.writePart(ctx, st, 1, io.MultiReader(bytes.NewReader(head[:n]), body), dist, MaxPutSize)
+		if err != nil {
+			st.discard()
+			return ObjectInfo{}, err
+		}
+	}
+	defer st.discard()
 	meta := &ObjectMeta{
 		Bucket: bucketName, Key: key, VersionID: newID(), Size: size, ETag: hex.EncodeToString(sum),
 		ContentType: opts.ContentType, UserMeta: opts.UserMeta, Headers: opts.Headers,
 		Erasure: ErasureInfo{Data: s.k, Parity: s.m, BlockSize: s.cfg.BlockSize, Distribution: dist},
 		Parts:   []PartInfo{{Number: 1, Size: size, ETag: hex.EncodeToString(sum)}},
+		Inline:  st.inline,
 	}
 	if opts.Precommit != nil {
 		ck, err := opts.Precommit(sum)
@@ -310,9 +371,9 @@ func (s *Store) commit(b *bucket, meta *ObjectMeta, st *stage, cond Conditions) 
 		s.unpublish(meta)
 		return ObjectInfo{}, errWriteQuorum(ok, s.writeQuorum)
 	}
-	b.index.put(entry{key: meta.Key, versionID: meta.VersionID, size: meta.Size, etag: meta.ETag, modTime: meta.ModTime})
+	b.index.put(entryOf(meta))
 	if exists {
-		s.removeVersion(b.name, meta.Key, cur.versionID)
+		s.removeVersion(b.name, meta.Key, cur)
 	}
 	if ok < s.n && s.heal != nil {
 		s.heal.enqueue(b.name, meta.Key)
@@ -321,12 +382,10 @@ func (s *Store) commit(b *bucket, meta *ObjectMeta, st *stage, cond Conditions) 
 	return meta.info(), nil
 }
 
-// publish moves a staged version into place on each live disk of the
-// stage: metadata is written and synced in the staging area, the data
-// directory is renamed into the object directory, then the metadata, and
-// the directory is synced. The metadata rename is the commit point on that
-// disk. It returns the number of disks that committed.
-func (s *Store) publish(st *stage, meta *ObjectMeta) int {
+// forStage runs fn for every live disk of the stage in parallel and drops
+// the disks where it fails.
+func (s *Store) forStage(st *stage, fn func(d int) error) {
+	errs := make([]error, s.n)
 	var wg sync.WaitGroup
 	for d := range s.disks {
 		if !st.alive[d] {
@@ -335,37 +394,78 @@ func (s *Store) publish(st *stage, meta *ObjectMeta) int {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := s.publishOne(st, d, meta); err != nil {
-				st.fail(d, err)
-			}
+			errs[d] = fn(d)
 		}()
 	}
 	wg.Wait()
-	return st.count()
+	for d, err := range errs {
+		if err != nil {
+			st.fail(d, err)
+		}
+	}
 }
 
-func (s *Store) publishOne(st *stage, d int, meta *ObjectMeta) error {
-	dk := s.disks[d]
-	data, err := encodeFramed(meta.forDisk(d))
-	if err != nil {
-		return err
+// flushStage makes everything the stage's disks pushed durable: one flush
+// per device, shared with concurrent commits.
+func (s *Store) flushStage(st *stage) {
+	done := map[*barrier]error{}
+	for d, dk := range s.disks {
+		if !st.alive[d] || dk.barrier == nil {
+			continue
+		}
+		err, ok := done[dk.barrier]
+		if !ok {
+			err = dk.barrier.wait()
+			done[dk.barrier] = err
+		}
+		if err != nil {
+			st.fail(d, err)
+		}
 	}
-	metaTmp := st.dir(d, "meta")
-	if err := dk.writeFileSynced(metaTmp, data); err != nil {
-		return err
-	}
-	objDir := dk.objectDir(meta.Bucket, meta.Key)
-	if err := dk.mkdirAll(objDir); err != nil {
-		return err
-	}
-	if err := os.Rename(st.dir(d, "data"), filepath.Join(objDir, meta.VersionID)); err != nil {
-		return err
-	}
-	if err := os.Rename(metaTmp, filepath.Join(objDir, meta.VersionID+metaSuffix)); err != nil {
-		dk.removeAll(filepath.Join(objDir, meta.VersionID))
-		return err
-	}
-	return dk.syncDir(objDir)
+}
+
+// publish moves a staged version into place on each live disk of the
+// stage, in two durable steps. First the metadata is written into the
+// staging area and pushed, and each device is flushed: data and metadata
+// are now on stable storage under temporary names. Then the data directory
+// and the metadata are renamed into the object directory, metadata last,
+// the directory is pushed, and each device is flushed again. The metadata
+// rename is the commit point on that disk. It returns the number of disks
+// that committed.
+func (s *Store) publish(st *stage, meta *ObjectMeta) int {
+	s.forStage(st, func(d int) error {
+		var payload []byte
+		if st.inline {
+			payload = st.payload[d]
+		}
+		data, err := encodeFramedPayload(meta.forDisk(d), payload)
+		if err != nil {
+			return err
+		}
+		return s.disks[d].writeFilePushed(st.metaTmp(d), data)
+	})
+	s.flushStage(st)
+	s.forStage(st, func(d int) error {
+		dk := s.disks[d]
+		objDir := dk.objectDir(meta.Bucket, meta.Key)
+		if _, err := dk.mkdirAllPushed(objDir); err != nil {
+			return err
+		}
+		if !st.inline {
+			if err := os.Rename(st.dir(d, "data"), filepath.Join(objDir, meta.VersionID)); err != nil {
+				return err
+			}
+		}
+		if err := os.Rename(st.metaTmp(d), filepath.Join(objDir, meta.VersionID+metaSuffix)); err != nil {
+			if !st.inline {
+				dk.removeAll(filepath.Join(objDir, meta.VersionID))
+			}
+			return err
+		}
+		return dk.pushDir(objDir)
+	})
+	s.flushStage(st)
+	return st.count()
 }
 
 // unpublish rolls back a version that did not reach a write quorum, on
@@ -383,11 +483,13 @@ func (s *Store) unpublish(meta *ObjectMeta) {
 // removeVersion deletes a superseded version: its metadata at once, its
 // data now or, if a reader holds a lease on it, when the last reader is
 // done. The caller holds the key lock.
-func (s *Store) removeVersion(bucket, key, version string) {
+func (s *Store) removeVersion(bucket, key string, old entry) {
 	s.onDisks(func(d *disk) error {
-		return removeIfExists(filepath.Join(d.objectDir(bucket, key), version+metaSuffix))
+		return removeIfExists(filepath.Join(d.objectDir(bucket, key), old.versionID+metaSuffix))
 	})
-	s.dropData(bucket, key, version, false)
+	if !old.inline {
+		s.dropData(bucket, key, old.versionID, false)
+	}
 }
 
 // dropData deletes a version's data directories. If no reader holds the
@@ -445,7 +547,14 @@ func (s *Store) DeleteObject(bucketName, key string) error {
 		return errWriteQuorum(removed, s.writeQuorum)
 	}
 	b.index.delete(key)
-	s.dropData(bucketName, key, cur.versionID, true)
+	if cur.inline {
+		s.onDisks(func(d *disk) error {
+			os.Remove(d.objectDir(bucketName, key)) // only if empty
+			return nil
+		})
+	} else {
+		s.dropData(bucketName, key, cur.versionID, true)
+	}
 	s.stats.objectsDeleted.Add(1)
 	return nil
 }

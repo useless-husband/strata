@@ -50,6 +50,9 @@ type Config struct {
 	// ReadOnly opens the disks for inspection only: no formatting, no
 	// background work. Used by "strata info" and "strata scrub".
 	ReadOnly bool
+	// InlineLimit is the largest object stored inline in its metadata
+	// files (default 128 KiB; negative disables inlining).
+	InlineLimit int
 }
 
 // Limits from the S3 API.
@@ -83,6 +86,7 @@ type Store struct {
 	heal      *healer
 	stats     *Stats
 
+	barriers      []*barrier
 	lastDiskCheck atomic.Int64
 	diskCheckMu   sync.Mutex
 
@@ -114,6 +118,12 @@ func Open(cfg Config) (*Store, error) {
 	}
 	if cfg.DiskCheckInterval == 0 {
 		cfg.DiskCheckInterval = 5 * time.Second
+	}
+	if cfg.InlineLimit == 0 {
+		cfg.InlineLimit = defaultInlineLimit
+	}
+	if cfg.InlineLimit > maxInlineLimit {
+		return nil, fmt.Errorf("inline limit %d is above the maximum of %d", cfg.InlineLimit, maxInlineLimit)
 	}
 	n := len(cfg.Disks)
 	if cfg.DataShards < 1 || cfg.ParityShards < 0 || cfg.DataShards+cfg.ParityShards != n {
@@ -199,6 +209,10 @@ func Open(cfg Config) (*Store, error) {
 	for _, d := range s.disks {
 		d.online.Store(true)
 	}
+	if err := s.setupBarriers(); err != nil {
+		s.closeDisks()
+		return nil, err
+	}
 
 	start := time.Now()
 	toHeal, err := s.scan()
@@ -250,6 +264,10 @@ func (s *Store) closeDisks() {
 	for _, d := range s.disks {
 		d.releaseLock()
 	}
+	for _, b := range s.barriers {
+		b.f.Close()
+	}
+	s.barriers = nil
 }
 
 // DataShards, ParityShards and the other accessors describe the layout.

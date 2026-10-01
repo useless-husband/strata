@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -83,11 +84,11 @@ func (ts *testStore) wipe(disks ...int) {
 // copies with a deep scrub.
 func TestSurvivesLosingParityDisks(t *testing.T) {
 	seed := testSeed(t)
-	for _, cfg := range [][2]int{{2, 1}, {2, 2}, {4, 2}, {3, 3}} {
-		k, m := cfg[0], cfg[1]
-		t.Run(fmt.Sprintf("%d+%d", k, m), func(t *testing.T) {
+	for _, cfg := range [][3]int{{2, 1, 0}, {2, 2, 0}, {4, 2, 0}, {3, 3, 0}, {4, 2, -1}, {3, 3, -1}} {
+		k, m, inline := cfg[0], cfg[1], cfg[2]
+		t.Run(fmt.Sprintf("%d+%d/inline=%v", k, m, inline == 0), func(t *testing.T) {
 			r := rand.New(rand.NewPCG(seed, uint64(k*10+m)))
-			ts := newTestStore(t, k, m, func(c *Config) { c.BlockSize = 4096 })
+			ts := newTestStore(t, k, m, func(c *Config) { c.BlockSize = 4096; c.InlineLimit = inline })
 			objs := corpus(t, ts, r)
 			forEachSubset(k+m, m, func(lost []int) {
 				before := ts.Stats().HealedObjects
@@ -118,9 +119,35 @@ func TestSurvivesLosingParityDisks(t *testing.T) {
 // TestBitRot flips random bits in up to m shard files of every object,
 // checks reads are still bit-exact, and that on-read healing repairs them.
 func TestBitRot(t *testing.T) {
+	for _, inline := range []int{0, -1} {
+		t.Run(fmt.Sprintf("inline=%v", inline == 0), func(t *testing.T) { testBitRot(t, inline) })
+	}
+}
+
+// shardRegions returns, for disk d's copy of an object, the files holding
+// its shard data and the offset where the shard data starts in each: the
+// part files, or the metadata file of an inline object (after its header).
+func (ts *testStore) shardRegions(d int, info ObjectInfo, inline bool) (paths []string, offsets []int) {
+	dir := ts.Store.disks[d].objectDir("bkt", info.Key)
+	if inline {
+		path := filepath.Join(dir, info.VersionID+metaSuffix)
+		b, err := os.ReadFile(path)
+		if err != nil {
+			ts.t.Fatal(err)
+		}
+		return []string{path}, []int{frameHeader + int(binary.BigEndian.Uint32(b[8:]))}
+	}
+	for _, p := range info.Parts {
+		paths = append(paths, filepath.Join(dir, info.VersionID, "part."+strconv.Itoa(p.Number)))
+		offsets = append(offsets, 0)
+	}
+	return paths, offsets
+}
+
+func testBitRot(t *testing.T, inlineLimit int) {
 	seed := testSeed(t)
 	r := rand.New(rand.NewPCG(seed, 99))
-	ts := newTestStore(t, 4, 2, func(c *Config) { c.BlockSize = 4096 })
+	ts := newTestStore(t, 4, 2, func(c *Config) { c.BlockSize = 4096; c.InlineLimit = inlineLimit })
 	objs := corpus(t, ts, r)
 	flipped := 0
 	for key := range objs {
@@ -130,18 +157,17 @@ func TestBitRot(t *testing.T) {
 		}
 		o.Close()
 		for _, d := range r.Perm(6)[:1+r.IntN(2)] {
-			dir := filepath.Join(ts.Store.disks[d].objectDir("bkt", key), o.Info.VersionID)
-			for _, p := range o.Info.Parts {
-				path := filepath.Join(dir, "part."+strconv.Itoa(p.Number))
+			paths, offsets := ts.shardRegions(d, o.Info, o.meta.Inline)
+			for i, path := range paths {
 				data, err := os.ReadFile(path)
 				if err != nil {
 					t.Fatal(err)
 				}
-				if len(data) == 0 {
+				if len(data) == offsets[i] {
 					continue
 				}
-				for i := 0; i < 1+r.IntN(5); i++ {
-					data[r.IntN(len(data))] ^= 1 << r.IntN(8)
+				for j := 0; j < 1+r.IntN(5); j++ {
+					data[offsets[i]+r.IntN(len(data)-offsets[i])] ^= 1 << r.IntN(8)
 				}
 				os.WriteFile(path, data, 0o644)
 				flipped++
@@ -195,23 +221,29 @@ func TestCorruptMetadataIsHealed(t *testing.T) {
 // TestLossBeyondParityIsReported wipes m+1 disks: reads must fail cleanly,
 // never return wrong data, and healing must report the loss.
 func TestLossBeyondParityIsReported(t *testing.T) {
-	r := rand.New(rand.NewPCG(5, 5))
-	ts := newTestStore(t, 2, 1, func(c *Config) { c.BlockSize = 4096 })
-	ts.MakeBucket("bkt")
-	data := randData(r, 20000)
-	ts.put("bkt", "k", data)
-	o, _ := ts.OpenObject("bkt", "k")
-	o.Close()
-	for _, d := range ts.Store.disks[:2] {
-		os.RemoveAll(filepath.Join(d.objectDir("bkt", "k"), o.Info.VersionID))
-	}
-	got, err := ts.get("bkt", "k")
-	if err == nil || bytes.Equal(got, data) {
-		t.Fatalf("read with two of three shards gone: err=%v", err)
-	}
-	res, err := ts.HealObject(context.Background(), "bkt", "k", HealOptions{Deep: true})
-	if err != nil || !res.Lost {
-		t.Fatalf("heal: %+v %v", res, err)
+	for _, size := range []int{20_000, 300_000} { // inline and in files
+		r := rand.New(rand.NewPCG(5, 5))
+		ts := newTestStore(t, 2, 1, func(c *Config) { c.BlockSize = 4096 })
+		ts.MakeBucket("bkt")
+		data := randData(r, size)
+		ts.put("bkt", "k", data)
+		o, _ := ts.OpenObject("bkt", "k")
+		o.Close()
+		for _, d := range ts.Store.disks[:2] {
+			if o.meta.Inline {
+				os.Remove(filepath.Join(d.objectDir("bkt", "k"), o.Info.VersionID+metaSuffix))
+			} else {
+				os.RemoveAll(filepath.Join(d.objectDir("bkt", "k"), o.Info.VersionID))
+			}
+		}
+		got, err := ts.get("bkt", "k")
+		if err == nil || bytes.Equal(got, data) {
+			t.Fatalf("size %d: read with two of three shards gone: err=%v", size, err)
+		}
+		res, err := ts.HealObject(context.Background(), "bkt", "k", HealOptions{Deep: true})
+		if err != nil || !res.Lost {
+			t.Fatalf("size %d: heal: %+v %v", size, res, err)
+		}
 	}
 }
 
@@ -231,10 +263,15 @@ func (ts *testStore) writeWithCrash(key string, data []byte, onDisks []int) *Obj
 		Erasure: ErasureInfo{Data: ts.k, Parity: ts.m, BlockSize: ts.cfg.BlockSize, Distribution: dist},
 		Parts:   []PartInfo{{Number: 1, Size: size, ETag: fmt.Sprintf("%x", sum)}},
 	}
+	keep := make([]bool, ts.n)
 	for _, d := range onDisks {
-		if err := ts.publishOne(st, d, meta); err != nil {
-			ts.t.Fatal(err)
-		}
+		keep[d] = true
+	}
+	for d := range st.alive {
+		st.alive[d] = st.alive[d] && keep[d]
+	}
+	if got := ts.publish(st, meta); got != len(onDisks) {
+		ts.t.Fatalf("published on %d disks, want %d", got, len(onDisks))
 	}
 	st.discard()
 	return meta
@@ -295,5 +332,37 @@ func forEachSubset(n, size int, f func([]int)) {
 		for j := i + 1; j < size; j++ {
 			idx[j] = idx[j-1] + 1
 		}
+	}
+}
+
+// TestInlineCorruptDataShardUsesParity is the regression test for inline
+// reads: when the copy of a data shard has the right size but rotted
+// content, the parity copies must be loaded too, or the read fails with
+// fewer than k shards although k+m-1 are intact.
+func TestInlineCorruptDataShardUsesParity(t *testing.T) {
+	r := rand.New(rand.NewPCG(7, 7))
+	for _, k := range []int{2, 4} {
+		ts := newTestStore(t, k, 2, func(c *Config) { c.BlockSize = 4096 })
+		ts.MakeBucket("bkt")
+		data := randData(r, 10_000)
+		ts.put("bkt", "small", data)
+		o, err := ts.OpenObject("bkt", "small")
+		if err != nil {
+			t.Fatal(err)
+		}
+		o.Close()
+		if !o.meta.Inline {
+			t.Fatal("a 10 KB object was not stored inline")
+		}
+		for shard := 0; shard < 2; shard++ { // up to m data shards rot
+			d := o.meta.Erasure.holder(shard)
+			paths, offsets := ts.shardRegions(d, o.Info, true)
+			b, _ := os.ReadFile(paths[0])
+			b[offsets[0]+len(b[offsets[0]:])/2] ^= 0x10 // size unchanged
+			os.WriteFile(paths[0], b, 0o644)
+			ts.mustGet("bkt", "small", data)
+		}
+		ts.WaitHealIdle()
+		ts.deepClean(fmt.Sprintf("%d+2 after healing rotted inline data shards", k))
 	}
 }

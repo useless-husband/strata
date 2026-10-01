@@ -7,49 +7,116 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 	"time"
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
-// Metadata files are framed as magic, CRC32C of the body, body (JSON), so a
-// torn or rotted metadata file is detected rather than misread.
+// Metadata files are framed as
+//
+//	magic "STM1" | CRC32C of the JSON | length of the JSON | JSON | payload
+//
+// so a torn or rotted header is detected rather than misread. The payload
+// is the inline shard data of a small object (see inlineLimit); it is
+// covered by its own per-block checksums, not by the header CRC, so that
+// listings and HEADs can read the header without the data.
 var metaMagic = [4]byte{'S', 'T', 'M', '1'}
+
+const frameHeader = 12
 
 var errCorruptMeta = errors.New("corrupt metadata file")
 
-func encodeFramed(v any) ([]byte, error) {
+func encodeFramed(v any) ([]byte, error) { return encodeFramedPayload(v, nil) }
+
+func encodeFramedPayload(v any, payload []byte) ([]byte, error) {
 	body, err := json.Marshal(v)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]byte, 8+len(body))
+	out := make([]byte, frameHeader+len(body)+len(payload))
 	copy(out, metaMagic[:])
 	binary.BigEndian.PutUint32(out[4:], crc32.Checksum(body, castagnoli))
-	copy(out[8:], body)
+	binary.BigEndian.PutUint32(out[8:], uint32(len(body)))
+	copy(out[frameHeader:], body)
+	copy(out[frameHeader+len(body):], payload)
 	return out, nil
 }
 
-func decodeFramed(b []byte, v any) error {
-	if len(b) < 8 || !bytes.Equal(b[:4], metaMagic[:]) {
-		return errCorruptMeta
+// decodeFramedPayload decodes a frame and returns its payload (aliasing b).
+func decodeFramedPayload(b []byte, v any) ([]byte, error) {
+	if len(b) < frameHeader || !bytes.Equal(b[:4], metaMagic[:]) {
+		return nil, errCorruptMeta
 	}
-	if crc32.Checksum(b[8:], castagnoli) != binary.BigEndian.Uint32(b[4:]) {
-		return errCorruptMeta
+	n := int(binary.BigEndian.Uint32(b[8:]))
+	if n > len(b)-frameHeader {
+		return nil, errCorruptMeta
 	}
-	if err := json.Unmarshal(b[8:], v); err != nil {
-		return fmt.Errorf("%w: %v", errCorruptMeta, err)
+	body := b[frameHeader : frameHeader+n]
+	if crc32.Checksum(body, castagnoli) != binary.BigEndian.Uint32(b[4:]) {
+		return nil, errCorruptMeta
 	}
-	return nil
+	if err := json.Unmarshal(body, v); err != nil {
+		return nil, fmt.Errorf("%w: %v", errCorruptMeta, err)
+	}
+	return b[frameHeader+n:], nil
 }
 
+func decodeFramed(b []byte, v any) error {
+	_, err := decodeFramedPayload(b, v)
+	return err
+}
+
+// readFramed reads and decodes a whole metadata file.
 func readFramed(path string, v any) error {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
 	return decodeFramed(b, v)
+}
+
+// readFramedPayload reads a whole metadata file and returns its payload.
+func readFramedPayload(path string, v any) ([]byte, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return decodeFramedPayload(b, v)
+}
+
+// readFramedHeader decodes a metadata file without reading its payload.
+func readFramedHeader(path string, v any) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	buf := make([]byte, 4096)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		if err == io.EOF {
+			return errCorruptMeta
+		}
+		return err
+	}
+	buf = buf[:n]
+	if n < frameHeader {
+		return errCorruptMeta
+	}
+	if want := frameHeader + int(binary.BigEndian.Uint32(buf[8:])); want > n {
+		if want > 1<<20 {
+			return errCorruptMeta
+		}
+		more := make([]byte, want-n)
+		if _, err := io.ReadFull(f, more); err != nil {
+			return errCorruptMeta
+		}
+		buf = append(buf, more...)
+	}
+	_, err = decodeFramedPayload(buf, v)
+	return err
 }
 
 // ErasureInfo describes how an object version is spread over the disks.
@@ -104,6 +171,9 @@ type ObjectMeta struct {
 	ChecksumType      string      `json:"checksumType,omitempty"`
 	Erasure           ErasureInfo `json:"erasure"`
 	Parts             []PartInfo  `json:"parts"`
+	// Inline objects keep each disk's shard file inside that disk's
+	// metadata file, as its payload, instead of in a data directory.
+	Inline bool `json:"inline,omitempty"`
 }
 
 func (m *ObjectMeta) modTime() time.Time { return time.Unix(0, m.ModTime).UTC() }

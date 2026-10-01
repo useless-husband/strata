@@ -54,6 +54,10 @@ type StatsSnapshot struct {
 	ScrubbedObjects  int64
 	ScrubbedBytes    int64
 	HealQueue        int
+	// SyncRequests counts waits for a drive-cache flush, SyncFlushes the
+	// flushes (F_FULLFSYNC) actually issued for them; see barrier.go.
+	SyncRequests     int64
+	SyncFlushes      int64
 	MultipartUploads int
 	Disks            []DiskStatus
 	DataShards       int
@@ -84,6 +88,10 @@ func (s *Store) Stats() StatsSnapshot {
 		s.heal.mu.Lock()
 		snap.HealQueue = len(s.heal.queue)
 		s.heal.mu.Unlock()
+	}
+	for _, b := range s.barriers {
+		snap.SyncRequests += b.requests.Load()
+		snap.SyncFlushes += b.flushes.Load()
 	}
 	s.uploads.mu.Lock()
 	snap.MultipartUploads = len(s.uploads.m)
