@@ -103,10 +103,11 @@ func trimETag(s string) string {
 func writeConditions(r *http.Request) (store.Conditions, error) {
 	var c store.Conditions
 	if v := r.Header.Get("If-None-Match"); v != "" {
-		if strings.TrimSpace(v) != "*" {
-			return c, s3err.NotImplemented.With("If-None-Match on writes only supports *")
+		if strings.TrimSpace(v) == "*" {
+			c.IfNoneMatch = true
+		} else {
+			c.IfNoneMatchETag = trimETag(v)
 		}
-		c.IfNoneMatch = true
 	}
 	if v := r.Header.Get("If-Match"); v != "" {
 		c.IfMatch = trimETag(v)

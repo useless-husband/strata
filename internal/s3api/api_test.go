@@ -444,6 +444,10 @@ func TestConditionalRequests(t *testing.T) {
 	e.expect(e.do("PUT", "/bkt/k", []byte("v2"), "If-Match", `"wrong"`), 412, "PreconditionFailed")
 	e.expect(e.do("PUT", "/bkt/k", []byte("v2"), "If-Match", etag), 200, "")
 	e.expect(e.do("PUT", "/bkt/absent", []byte("v2"), "If-Match", etag), 404, "NoSuchKey")
+	// If-None-Match with an ETag (an RGW extension strata accepts).
+	cur := e.do("HEAD", "/bkt/k", nil).Header.Get("ETag")
+	e.expect(e.do("PUT", "/bkt/k", []byte("v3"), "If-None-Match", cur), 412, "PreconditionFailed")
+	e.expect(e.do("PUT", "/bkt/k", []byte("v3"), "If-None-Match", `"other"`), 200, "")
 }
 
 func TestListingAPI(t *testing.T) {

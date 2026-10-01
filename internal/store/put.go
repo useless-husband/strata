@@ -50,12 +50,18 @@ type Checksum struct {
 // Conditions are the conditional-write headers of a PUT or
 // CompleteMultipartUpload, checked atomically at commit time.
 type Conditions struct {
-	IfNoneMatch bool   // If-None-Match: * — fail if the key exists
-	IfMatch     string // If-Match: <etag> — fail unless the current ETag matches
+	IfNoneMatch bool // If-None-Match: * — fail if the key exists
+	// IfNoneMatchETag fails the write if the current ETag is this one (an
+	// RGW extension; S3 accepts only "*").
+	IfNoneMatchETag string
+	IfMatch         string // If-Match: <etag> — fail unless the current ETag matches
 }
 
 func (c Conditions) check(cur entry, exists bool) error {
 	if c.IfNoneMatch && exists {
+		return s3err.PreconditionFailed
+	}
+	if c.IfNoneMatchETag != "" && exists && c.IfNoneMatchETag == cur.etag {
 		return s3err.PreconditionFailed
 	}
 	if c.IfMatch != "" {
