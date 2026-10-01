@@ -178,13 +178,6 @@ type ObjectMeta struct {
 
 func (m *ObjectMeta) modTime() time.Time { return time.Unix(0, m.ModTime).UTC() }
 
-// sameVersion reports whether two copies describe the same version with the
-// same content (they differ only in Erasure.Index).
-func (m *ObjectMeta) sameVersion(o *ObjectMeta) bool {
-	return m.VersionID == o.VersionID && m.Size == o.Size && m.ETag == o.ETag &&
-		m.Key == o.Key && len(m.Parts) == len(o.Parts)
-}
-
 // forDisk returns a copy of the metadata as stored on disk d.
 func (m *ObjectMeta) forDisk(d int) *ObjectMeta {
 	c := *m

@@ -165,14 +165,6 @@ func (d *disk) flush() error {
 	return nil
 }
 
-// syncFile makes one file durable on its own.
-func (d *disk) syncFile(f *os.File) error {
-	if err := d.push(f); err != nil {
-		return err
-	}
-	return d.flush()
-}
-
 // pushDir pushes a directory's entries (creations, renames).
 func (d *disk) pushDir(dir string) error {
 	if d.sync == SyncNone {
