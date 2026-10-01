@@ -1,0 +1,10 @@
+/strata
+/bin/
+/dist/
+/coverage.out
+/.venv/
+__pycache__/
+.DS_Store
+/testdata/fuzz/
+*.test
+*.prof
