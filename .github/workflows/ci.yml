@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is arm64 and runs the NEON kernel; ubuntu-latest is
+        # amd64 and runs the portable one.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go vet ./...
+      - run: go test -race -count=1 -p 4 ./...
+      - name: portable Reed-Solomon kernel
+        run: go test -count=1 -tags purego ./internal/rs ./internal/store
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: gofmt
+        run: test -z "$(gofmt -l . | tee /dev/stderr)"
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+      - name: go mod tidy
+        run: go mod tidy && git diff --exit-code go.mod
+
+  clients:
+    name: real clients (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: go build -o strata ./cmd/strata
+      - name: AWS CLI
+        run: |
+          aws --version
+          STRATA_BIN=$PWD/strata STRATA_BIG_MB=120 test/awscli.sh
+      - name: AWS SDK for Go v2 and minio-go
+        run: cd test/interop && STRATA_BIN=$GITHUB_WORKSPACE/strata go test -count=1 -v ./...
+      - name: boto3
+        run: |
+          python -m pip install boto3
+          STRATA_BIN=$PWD/strata python test/boto3_test.py
+      - name: kill -9 during uploads
+        run: STRATA_BIN=$PWD/strata go test -count=1 -run TestKill -v ./cmd/strata
