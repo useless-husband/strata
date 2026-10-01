@@ -129,7 +129,7 @@ func TestModelRandomOperations(t *testing.T) {
 			counts["CreateBucket"]++
 			resp := e.do("PUT", "/"+b, nil)
 			if bm != nil {
-				check("CreateBucket "+b, resp, 409, "BucketAlreadyOwnedByYou")
+				check("CreateBucket "+b, resp, 200, "") // us-east-1: no-op
 			} else {
 				check("CreateBucket "+b, resp, 200, "")
 				m.buckets[b] = map[string]*mObject{}

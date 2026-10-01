@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/useless-husband/strata/internal/checksum"
 	"github.com/useless-husband/strata/internal/s3err"
 )
 
@@ -32,15 +33,16 @@ import (
 // interrupted completion can be retried.
 
 type uploadMeta struct {
-	ID          string            `json:"id"`
-	Bucket      string            `json:"bucket"`
-	Key         string            `json:"key"`
-	Initiated   int64             `json:"initiated"`
-	ContentType string            `json:"contentType,omitempty"`
-	UserMeta    map[string]string `json:"userMeta,omitempty"`
-	Headers     map[string]string `json:"headers,omitempty"`
-	Checksum    string            `json:"checksumAlgorithm,omitempty"`
-	Dist        []int             `json:"distribution"`
+	ID           string            `json:"id"`
+	Bucket       string            `json:"bucket"`
+	Key          string            `json:"key"`
+	Initiated    int64             `json:"initiated"`
+	ContentType  string            `json:"contentType,omitempty"`
+	UserMeta     map[string]string `json:"userMeta,omitempty"`
+	Headers      map[string]string `json:"headers,omitempty"`
+	Checksum     string            `json:"checksumAlgorithm,omitempty"`
+	ChecksumType string            `json:"checksumType,omitempty"`
+	Dist         []int             `json:"distribution"`
 }
 
 type partMeta struct {
@@ -59,9 +61,39 @@ type upload struct {
 type uploads struct {
 	mu sync.Mutex
 	m  map[string]*upload
+	// done remembers recently completed uploads, so a client that retries
+	// CompleteMultipartUpload (because the first response was lost) gets
+	// the same answer, as from S3. Kept in memory only.
+	done  map[string]*completed
+	order []string
 }
 
-func newUploads() *uploads { return &uploads{m: map[string]*upload{}} }
+type completed struct {
+	bucket, key string
+	parts       string // the completed part list, for matching retries
+	info        ObjectInfo
+}
+
+const maxCompleted = 10000
+
+func newUploads() *uploads { return &uploads{m: map[string]*upload{}, done: map[string]*completed{}} }
+
+func (u *uploads) remember(id string, c *completed) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.done[id] = c
+	u.order = append(u.order, id)
+	if len(u.order) > maxCompleted {
+		delete(u.done, u.order[0])
+		u.order = u.order[1:]
+	}
+}
+
+func (u *uploads) completedUpload(id string) *completed {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.done[id]
+}
 
 func (u *uploads) get(id string) *upload {
 	u.mu.Lock()
@@ -103,15 +135,18 @@ type UploadInfo struct {
 	Initiated time.Time
 	// ChecksumAlgorithm is the algorithm requested at creation, if any.
 	ChecksumAlgorithm string
+	ChecksumType      string
 }
 
 func (up *upload) info() UploadInfo {
 	return UploadInfo{UploadID: up.meta.ID, Bucket: up.meta.Bucket, Key: up.meta.Key,
-		Initiated: time.Unix(0, up.meta.Initiated).UTC(), ChecksumAlgorithm: up.meta.Checksum}
+		Initiated: time.Unix(0, up.meta.Initiated).UTC(), ChecksumAlgorithm: up.meta.Checksum, ChecksumType: up.meta.ChecksumType}
 }
 
 // NewMultipartUpload starts an upload.
-func (s *Store) NewMultipartUpload(bucketName, key string, opts PutOptions, checksumAlgorithm string) (UploadInfo, error) {
+// checksumAlgorithm and checksumType (COMPOSITE or FULL_OBJECT) select how
+// the object's checksum is derived from its parts; empty for none.
+func (s *Store) NewMultipartUpload(bucketName, key string, opts PutOptions, checksumAlgorithm, checksumType string) (UploadInfo, error) {
 	if _, err := s.getBucket(bucketName); err != nil {
 		return UploadInfo{}, err
 	}
@@ -120,7 +155,7 @@ func (s *Store) NewMultipartUpload(bucketName, key string, opts PutOptions, chec
 	}
 	m := uploadMeta{ID: newID(), Bucket: bucketName, Key: key, Initiated: time.Now().UnixNano(),
 		ContentType: opts.ContentType, UserMeta: opts.UserMeta, Headers: opts.Headers,
-		Checksum: checksumAlgorithm, Dist: distribution(key, s.n)}
+		Checksum: checksumAlgorithm, ChecksumType: checksumType, Dist: distribution(key, s.n)}
 	data, err := encodeFramed(&m)
 	if err != nil {
 		return UploadInfo{}, err
@@ -284,8 +319,25 @@ func (s *Store) ListParts(bucket, key, uploadID string, marker, max int) (ListPa
 
 // CompletePart is a part named in CompleteMultipartUpload.
 type CompletePart struct {
-	Number int
-	ETag   string // without quotes
+	Number   int
+	ETag     string // without quotes
+	Checksum string // the part's checksum, if the client listed it
+}
+
+// CompleteOptions are the options of CompleteMultipartUpload.
+type CompleteOptions struct {
+	Conditions Conditions
+	// Checksum is the object checksum the client expects (the
+	// x-amz-checksum-* header of the request), if any.
+	Checksum string
+}
+
+func partListKey(parts []CompletePart) string {
+	var b strings.Builder
+	for _, p := range parts {
+		fmt.Fprintf(&b, "%d:%s;", p.Number, strings.Trim(p.ETag, `"`))
+	}
+	return b.String()
 }
 
 // multipartETag is the ETag S3 gives multipart objects: the MD5 of the
@@ -300,13 +352,17 @@ func multipartETag(parts []PartInfo) string {
 }
 
 // CompleteMultipartUpload assembles the named parts into an object.
-func (s *Store) CompleteMultipartUpload(ctx context.Context, bucketName, key, uploadID string, parts []CompletePart, cond Conditions) (ObjectInfo, error) {
+func (s *Store) CompleteMultipartUpload(ctx context.Context, bucketName, key, uploadID string, parts []CompletePart, opt CompleteOptions) (ObjectInfo, error) {
 	b, err := s.getBucket(bucketName)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
 	up, err := s.getUpload(bucketName, key, uploadID)
 	if err != nil {
+		// A retry of a completion that succeeded gets the same answer.
+		if c := s.uploads.completedUpload(uploadID); c != nil && c.bucket == bucketName && c.key == key && c.parts == partListKey(parts) {
+			return c.info, nil
+		}
 		return ObjectInfo{}, err
 	}
 	up.mu.Lock()
@@ -326,7 +382,7 @@ func (s *Store) CompleteMultipartUpload(ctx context.Context, bucketName, key, up
 	var size int64
 	for i, cp := range parts {
 		pm := up.parts[cp.Number]
-		if pm == nil || strings.Trim(cp.ETag, `"`) != pm.ETag {
+		if pm == nil || strings.Trim(cp.ETag, `"`) != pm.ETag || (cp.Checksum != "" && cp.Checksum != pm.Checksum) {
 			return ObjectInfo{}, s3err.InvalidPart
 		}
 		if i < len(parts)-1 && pm.Size < MinPartSize {
@@ -347,6 +403,20 @@ func (s *Store) CompleteMultipartUpload(ctx context.Context, bucketName, key, up
 		meta.Parts = append(meta.Parts, pm.PartInfo)
 	}
 	meta.ETag = multipartETag(meta.Parts)
+	if algo := up.meta.Checksum; algo != "" {
+		var cps []checksum.MultipartPart
+		for _, pm := range chosen {
+			cps = append(cps, checksum.MultipartPart{Checksum: pm.Checksum, Size: pm.Size})
+		}
+		sum, err := checksum.Multipart(algo, up.meta.ChecksumType, cps)
+		if err != nil {
+			return ObjectInfo{}, s3err.InvalidRequest.With("The upload was created with checksum %s; %v", algo, err)
+		}
+		if opt.Checksum != "" && opt.Checksum != sum {
+			return ObjectInfo{}, s3err.BadDigest.With("The %s you specified did not match the calculated checksum.", algo)
+		}
+		meta.ChecksumAlgorithm, meta.Checksum, meta.ChecksumType = algo, sum, up.meta.ChecksumType
+	}
 
 	// Stage the version by hard-linking the shard files; the upload itself
 	// stays intact until the object is committed.
@@ -367,12 +437,13 @@ func (s *Store) CompleteMultipartUpload(ctx context.Context, bucketName, key, up
 	if st.count() < s.writeQuorum {
 		return ObjectInfo{}, errWriteQuorum(st.count(), s.writeQuorum)
 	}
-	info, err := s.commit(b, meta, st, cond)
+	info, err := s.commit(b, meta, st, opt.Conditions)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
 	up.done = true
 	s.uploads.remove(uploadID)
+	s.uploads.remember(uploadID, &completed{bucket: bucketName, key: key, parts: partListKey(parts), info: info})
 	s.onDisks(func(d *disk) error { return d.removeAll(d.uploadDir(uploadID)) })
 	return info, nil
 }

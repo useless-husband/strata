@@ -77,15 +77,19 @@ func objectAttributes(r *http.Request) (store.PutOptions, error) {
 }
 
 // stripAWSChunked removes the aws-chunked transfer coding from a
-// Content-Encoding value; it describes the request, not the object.
+// Content-Encoding value; it describes the request, not the object. A value
+// without it is kept exactly as sent.
 func stripAWSChunked(v string) string {
+	if !strings.Contains(v, "aws-chunked") {
+		return v
+	}
 	var keep []string
 	for _, p := range strings.Split(v, ",") {
 		if p = strings.TrimSpace(p); p != "" && p != "aws-chunked" {
 			keep = append(keep, p)
 		}
 	}
-	return strings.Join(keep, ",")
+	return strings.Join(keep, ", ")
 }
 
 func trimETag(s string) string {
@@ -149,13 +153,18 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, req *request)
 }
 
 // readSmallBody reads and verifies a small request body (XML documents).
-func (s *Server) readSmallBody(r *http.Request, req *request) ([]byte, error) {
+// With objectChecksum set, x-amz-checksum-* headers describe an object,
+// not the body, and are not checked against it.
+func (s *Server) readSmallBody(r *http.Request, req *request, objectChecksum bool) ([]byte, error) {
 	if err := checkContentMD5(r); err != nil {
 		return nil, err
 	}
 	br, err := newBodyReader(r, req.auth)
 	if err != nil {
 		return nil, err
+	}
+	if objectChecksum && !br.ckFromTr {
+		br.ck = nil
 	}
 	if br.size > maxXMLBody {
 		return nil, s3err.MalformedXML.With("The XML you provided was larger than the maximum allowed")
@@ -336,24 +345,28 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, req *request,
 
 	off, n := int64(0), info.Size
 	partial := false
+	multipart := strings.Contains(info.ETag, "-")
+	partChecksum := ""
+	if multipart {
+		h.Set("X-Amz-Mp-Parts-Count", strconv.Itoa(len(info.Parts)))
+	}
 	if pn := q.Get("partNumber"); pn != "" {
 		num, err := strconv.Atoi(pn)
 		if err != nil || num < 1 || num > store.MaxPartNumber {
 			s.writeError(w, r, req, s3err.InvalidArgument.With("Part number must be an integer between 1 and 10000, inclusive"))
 			return
 		}
+		// An object written in one PUT has a single part 1: the object.
 		if num > len(info.Parts) {
-			s.writeError(w, r, req, s3err.InvalidRange.With("The requested partnumber is not satisfiable"))
+			s.writeError(w, r, req, s3err.InvalidPart.With("The requested partnumber is not satisfiable"))
 			return
 		}
 		for _, p := range info.Parts[:num-1] {
 			off += p.Size
 		}
 		n = info.Parts[num-1].Size
-		partial = len(info.Parts) > 1 || info.Parts[0].Number != 1
-		if len(info.Parts) > 1 {
-			h.Set("X-Amz-Mp-Parts-Count", strconv.Itoa(len(info.Parts)))
-		}
+		partial = multipart
+		partChecksum = info.Parts[num-1].Checksum
 	} else if v := r.Header.Get("Range"); v != "" {
 		var ok bool
 		off, n, ok, err = parseRange(v, info.Size)
@@ -374,9 +387,17 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, req *request,
 			h.Set(hdr, v)
 		}
 	}
-	if info.Checksum != "" && !partial && strings.EqualFold(r.Header.Get("X-Amz-Checksum-Mode"), "ENABLED") {
-		h.Set(checksumHeader(info.ChecksumAlgorithm), info.Checksum)
-		h.Set("X-Amz-Checksum-Type", info.ChecksumType)
+	// Checksums are returned on request, for the whole object or for one
+	// part of a multipart object; a byte range has none.
+	if strings.EqualFold(r.Header.Get("X-Amz-Checksum-Mode"), "ENABLED") && info.ChecksumAlgorithm != "" {
+		switch {
+		case q.Get("partNumber") != "" && multipart && partChecksum != "":
+			h.Set(checksumHeader(info.ChecksumAlgorithm), partChecksum)
+			h.Set("X-Amz-Checksum-Type", info.ChecksumType)
+		case !partial:
+			h.Set(checksumHeader(info.ChecksumAlgorithm), info.Checksum)
+			h.Set("X-Amz-Checksum-Type", info.ChecksumType)
+		}
 	}
 	h.Set("Content-Length", strconv.FormatInt(n, 10))
 	status := http.StatusOK
@@ -408,7 +429,14 @@ func (s *Server) deleteObject(w http.ResponseWriter, r *http.Request, req *reque
 		s.writeError(w, r, req, s3err.InvalidArgument.With("Invalid version id specified"))
 		return
 	}
-	if err := s.store.DeleteObject(req.bucket, req.key); err != nil {
+	ifMatch := ""
+	if v := r.Header.Get("If-Match"); v != "" {
+		ifMatch = trimETag(v)
+		if strings.TrimSpace(v) == "*" {
+			ifMatch = "*"
+		}
+	}
+	if err := s.store.DeleteObjectIf(req.bucket, req.key, ifMatch); err != nil {
 		s.writeError(w, r, req, err)
 		return
 	}
@@ -507,4 +535,81 @@ func (s *Server) copyObject(w http.ResponseWriter, r *http.Request, req *request
 		return
 	}
 	writeXML(w, http.StatusOK, copyObjectResult{NS: s3NS, LastModified: iso8601(info.ModTime), ETag: `"` + info.ETag + `"`})
+}
+
+// getObjectAttributes implements GetObjectAttributes: the attributes named
+// in x-amz-object-attributes, without the data.
+func (s *Server) getObjectAttributes(w http.ResponseWriter, r *http.Request, req *request) {
+	want := map[string]bool{}
+	for _, a := range strings.Split(r.Header.Get("X-Amz-Object-Attributes"), ",") {
+		if a = strings.TrimSpace(a); a != "" {
+			want[a] = true
+		}
+	}
+	if len(want) == 0 {
+		s.writeError(w, r, req, s3err.InvalidArgument.With("The x-amz-object-attributes header specifying the attributes to be retrieved is either missing or empty"))
+		return
+	}
+	for a := range want {
+		switch a {
+		case "ETag", "Checksum", "ObjectParts", "StorageClass", "ObjectSize":
+		default:
+			s.writeError(w, r, req, s3err.InvalidArgument.With("Invalid attribute name specified: %s", a))
+			return
+		}
+	}
+	info, err := s.store.StatObject(req.bucket, req.key)
+	if err != nil {
+		s.writeError(w, r, req, err)
+		return
+	}
+	if err := checkPreconditions(r.Header, info, false); err != nil {
+		s.writeError(w, r, req, err)
+		return
+	}
+	out := objectAttributesXML{NS: s3NS}
+	if want["ETag"] {
+		out.ETag = info.ETag
+	}
+	if want["StorageClass"] {
+		out.StorageClass = "STANDARD"
+	}
+	if want["ObjectSize"] {
+		out.ObjectSize = &info.Size
+	}
+	if want["Checksum"] && info.Checksum != "" {
+		c := &checksumAttrs{ChecksumType: info.ChecksumType}
+		c.setChecksum(info.ChecksumAlgorithm, info.Checksum)
+		out.Checksum = c
+	}
+	if want["ObjectParts"] && strings.Contains(info.ETag, "-") {
+		maxParts, marker := 1000, 0
+		if v := r.Header.Get("X-Amz-Max-Parts"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 && n < maxParts {
+				maxParts = n
+			}
+		}
+		if v := r.Header.Get("X-Amz-Part-Number-Marker"); v != "" {
+			marker, _ = strconv.Atoi(v)
+		}
+		op := &objectPartsXML{TotalPartsCount: len(info.Parts), PartNumberMarker: marker, MaxParts: maxParts}
+		for _, p := range info.Parts {
+			if p.Number <= marker {
+				continue
+			}
+			if len(op.Parts) == maxParts {
+				op.IsTruncated = true
+				break
+			}
+			px := objectPartXML{PartNumber: p.Number, Size: p.Size}
+			if p.Checksum != "" {
+				px.setChecksum(info.ChecksumAlgorithm, p.Checksum)
+			}
+			op.Parts = append(op.Parts, px)
+			op.NextPartNumberMarker = p.Number
+		}
+		out.ObjectParts = op
+	}
+	w.Header().Set("Last-Modified", info.ModTime.UTC().Format(http.TimeFormat))
+	writeXML(w, http.StatusOK, out)
 }

@@ -312,8 +312,11 @@ func (v *Verifier) verifyPresigned(r *http.Request) (*Auth, error) {
 		return nil, malformed.With("the date in the Credential (%s) does not match X-Amz-Date", cred.date)
 	}
 	exp, err := strconv.ParseInt(q.Get("X-Amz-Expires"), 10, 64)
-	if err != nil || exp < 0 {
+	if err != nil {
 		return nil, malformed.With("X-Amz-Expires should be a number")
+	}
+	if exp < 0 {
+		return nil, s3err.AccessDenied.With("Request has expired")
 	}
 	if exp < 1 || time.Duration(exp)*time.Second > MaxPresignExpiry {
 		return nil, malformed.With("X-Amz-Expires must be less than a week (in seconds) that is 604800")

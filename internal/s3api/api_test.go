@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"crypto/md5"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
 	"hash/crc32"
-	"hash/crc64"
 	"io"
 	"math/rand/v2"
 	"net/http"
@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/useless-husband/strata/internal/checksum"
 	"github.com/useless-husband/strata/internal/sigv4"
 	"github.com/useless-husband/strata/internal/store"
 )
@@ -144,7 +145,11 @@ func TestBucketsAPI(t *testing.T) {
 	e.expect(e.do("GET", "/", nil), 200, "")
 	e.expect(e.do("PUT", "/Bad_Name", nil), 400, "InvalidBucketName")
 	e.expect(e.do("PUT", "/alpha", nil), 200, "")
-	e.expect(e.do("PUT", "/alpha", nil), 409, "BucketAlreadyOwnedByYou")
+	e.do("PUT", "/alpha/kept", []byte("k"))
+	// In us-east-1 re-creating a bucket you own succeeds and changes nothing.
+	e.expect(e.do("PUT", "/alpha", nil), 200, "")
+	e.expect(e.do("GET", "/alpha/kept", nil), 200, "")
+	e.expect(e.do("DELETE", "/alpha/kept", nil), 204, "")
 	e.expect(e.do("HEAD", "/alpha", nil), 200, "")
 	e.expect(e.do("HEAD", "/missing", nil), 404, "")
 	e.expect(e.do("GET", "/missing?list-type=2", nil), 404, "NoSuchBucket")
@@ -272,7 +277,9 @@ func TestPayloadVerification(t *testing.T) {
 
 func TestCRC64NVMECheckValue(t *testing.T) {
 	// The check value of CRC-64/NVME from the CRC catalogue.
-	if got := crc64.Checksum([]byte("123456789"), crc64NVME); got != 0xae8b14860a799888 {
+	h := checksum.New("CRC64NVME")
+	h.Write([]byte("123456789"))
+	if got := binary.BigEndian.Uint64(h.Sum(nil)); got != 0xae8b14860a799888 {
 		t.Fatalf("CRC-64/NVME(123456789) = %x", got)
 	}
 }
@@ -285,7 +292,7 @@ func TestChunkedUploads(t *testing.T) {
 	for i := range data {
 		data[i] = byte(r.Uint32())
 	}
-	h := crc64.New(crc64NVME)
+	h := checksum.New("CRC64NVME")
 	h.Write(data)
 	crc := base64.StdEncoding.EncodeToString(h.Sum(nil))
 	for _, tc := range []struct {
@@ -582,7 +589,13 @@ func TestMultipartAPI(t *testing.T) {
 	if r.StatusCode != 206 || string(r.body) != "tail" || r.Header.Get("X-Amz-Mp-Parts-Count") != "2" {
 		t.Fatalf("GET partNumber=2: %d %q %v", r.StatusCode, r.body, r.Header)
 	}
-	e.expect(complete("1", e1, "2", e2), 404, "NoSuchUpload")
+	// A retried completion gets the same answer; another part list does not.
+	again := complete("1", e1, "2", e2)
+	e.expect(again, 200, "")
+	if !bytes.Contains(again.body, []byte(res.ETag[1:len(res.ETag)-1])) {
+		t.Fatalf("retried completion: %s", again.body)
+	}
+	e.expect(complete("1", e1), 404, "NoSuchUpload")
 
 	// Abort.
 	r = e.do("POST", "/bkt/mp2?uploads", nil)
@@ -799,4 +812,145 @@ func TestReadFailureAbortsResponse(t *testing.T) {
 	if err == nil && resp.StatusCode == 200 && len(got) == len(data) {
 		t.Fatal("a failed read was delivered as a complete 200 response")
 	}
+}
+
+// TestS3BehavioursFromConformanceSuite covers behaviours that running
+// ceph/s3-tests showed strata had wrong (see docs/COMPATIBILITY.md).
+func TestS3BehavioursFromConformanceSuite(t *testing.T) {
+	e := newEnv(t, 2, 1)
+	e.do("PUT", "/bkt", nil)
+
+	// Paginated ListBuckets.
+	e.do("PUT", "/bkt2", nil)
+	r := e.do("GET", "/?max-buckets=1", nil)
+	var lb listAllMyBucketsResult
+	xml.Unmarshal(r.body, &lb)
+	if len(lb.Buckets) != 1 || lb.Buckets[0].Name != "bkt" || lb.ContinuationToken == "" {
+		t.Fatalf("first page: %s", r.body)
+	}
+	r = e.do("GET", "/?max-buckets=1&continuation-token="+lb.ContinuationToken, nil)
+	lb = listAllMyBucketsResult{}
+	xml.Unmarshal(r.body, &lb)
+	if len(lb.Buckets) != 1 || lb.Buckets[0].Name != "bkt2" || lb.ContinuationToken != "" {
+		t.Fatalf("second page: %s", r.body)
+	}
+
+	// Content-Encoding loses aws-chunked and nothing else.
+	for in, want := range map[string]string{"deflate, gzip": "deflate, gzip", "gzip, aws-chunked": "gzip", "aws-chunked": ""} {
+		e.do("PUT", "/bkt/enc", []byte("x"), "Content-Encoding", in)
+		if got := e.do("HEAD", "/bkt/enc", nil).Header.Get("Content-Encoding"); got != want {
+			t.Errorf("Content-Encoding %q stored as %q, want %q", in, got, want)
+		}
+	}
+
+	// Conditional DELETE.
+	etag := e.do("PUT", "/bkt/del", []byte("x")).Header.Get("ETag")
+	e.expect(e.do("DELETE", "/bkt/del", nil, "If-Match", `"nope"`), 412, "PreconditionFailed")
+	e.expect(e.do("DELETE", "/bkt/del", nil, "If-Match", etag), 204, "")
+	e.expect(e.do("DELETE", "/bkt/del", nil, "If-Match", `"nope"`), 204, "") // absent: no error
+
+	// partNumber on a single-PUT object: 1 is the object, 2 is InvalidPart.
+	e.do("PUT", "/bkt/single", []byte("body"))
+	r = e.do("GET", "/bkt/single?partNumber=1", nil)
+	if r.StatusCode != 200 || string(r.body) != "body" {
+		t.Fatalf("partNumber=1 of a single-part object: %d %q", r.StatusCode, r.body)
+	}
+	e.expect(e.do("GET", "/bkt/single?partNumber=2", nil), 400, "InvalidPart")
+
+	// An empty continuation token is no token, and is echoed.
+	r = e.do("GET", "/bkt?list-type=2&continuation-token=", nil)
+	e.expect(r, 200, "")
+	if !bytes.Contains(r.body, []byte("<ContinuationToken></ContinuationToken>")) {
+		t.Fatalf("empty continuation token not echoed: %s", r.body)
+	}
+
+	// A body sent with HTTP chunked transfer encoding (no Content-Length).
+	req := e.newRequest("PUT", "/bkt/te")
+	req.Body = io.NopCloser(strings.NewReader("chunked body"))
+	req.ContentLength = -1
+	e.signer.Sign(req, sigv4.UnsignedPayload)
+	e.expect(e.send(req), 200, "")
+	if got := e.do("GET", "/bkt/te", nil); string(got.body) != "chunked body" {
+		t.Fatalf("chunked upload stored %q", got.body)
+	}
+
+	// UploadPartCopy with a range past the source is InvalidRange.
+	r = e.do("POST", "/bkt/mp?uploads", nil)
+	var init initiateMultipartUploadResult
+	xml.Unmarshal(r.body, &init)
+	r = e.do("PUT", "/bkt/mp?partNumber=1&uploadId="+init.UploadID, nil,
+		"X-Amz-Copy-Source", "/bkt/single", "X-Amz-Copy-Source-Range", "bytes=0-21")
+	if r.code() != "InvalidRange" {
+		t.Fatalf("copy range past the source: %d %s", r.StatusCode, r.body)
+	}
+}
+
+// Multipart checksums: COMPOSITE for SHA256 and FULL_OBJECT for CRC32,
+// verified against the request, returned on completion, on HEAD with
+// checksum mode, per part, and by GetObjectAttributes.
+func TestMultipartChecksums(t *testing.T) {
+	e := newEnv(t, 2, 1)
+	e.do("PUT", "/bkt", nil)
+	parts := [][]byte{bytes.Repeat([]byte("A"), store.MinPartSize), []byte("tail")}
+	for _, tc := range []struct{ algo, typ string }{{"SHA256", "COMPOSITE"}, {"CRC32", "FULL_OBJECT"}, {"CRC64NVME", ""}} {
+		key := "/bkt/" + tc.algo
+		hdr := []string{"X-Amz-Checksum-Algorithm", tc.algo}
+		if tc.typ != "" {
+			hdr = append(hdr, "X-Amz-Checksum-Type", tc.typ)
+		}
+		r := e.do("POST", key+"?uploads", nil, hdr...)
+		e.expect(r, 200, "")
+		wantType := tc.typ
+		if wantType == "" {
+			wantType = "FULL_OBJECT" // the default for CRC64NVME
+		}
+		if r.Header.Get("X-Amz-Checksum-Type") != wantType {
+			t.Fatalf("%s: type %q", tc.algo, r.Header.Get("X-Amz-Checksum-Type"))
+		}
+		var init initiateMultipartUploadResult
+		xml.Unmarshal(r.body, &init)
+		var mps []checksum.MultipartPart
+		var cmu strings.Builder
+		cmu.WriteString("<CompleteMultipartUpload>")
+		var whole []byte
+		for i, p := range parts {
+			h := checksum.New(tc.algo)
+			h.Write(p)
+			sum := checksum.Encode(h.Sum(nil))
+			r := e.do("PUT", fmt.Sprintf("%s?partNumber=%d&uploadId=%s", key, i+1, init.UploadID), p, checksumHeader(tc.algo), sum)
+			e.expect(r, 200, "")
+			mps = append(mps, checksum.MultipartPart{Checksum: sum, Size: int64(len(p))})
+			fmt.Fprintf(&cmu, "<Part><PartNumber>%d</PartNumber><ETag>%s</ETag><Checksum%s>%s</Checksum%s></Part>", i+1, r.Header.Get("ETag"), tc.algo, sum, tc.algo)
+			whole = append(whole, p...)
+		}
+		cmu.WriteString("</CompleteMultipartUpload>")
+		want, _ := checksum.Multipart(tc.algo, wantType, mps)
+		if wantType == "FULL_OBJECT" {
+			h := checksum.New(tc.algo)
+			h.Write(whole)
+			if want != checksum.Encode(h.Sum(nil)) {
+				t.Fatalf("%s: combined CRC is not the CRC of the object", tc.algo)
+			}
+		}
+		e.expect(e.do("POST", key+"?uploadId="+init.UploadID, []byte(cmu.String()), checksumHeader(tc.algo), "AAAA"), 400, "BadDigest")
+		r = e.do("POST", key+"?uploadId="+init.UploadID, []byte(cmu.String()), checksumHeader(tc.algo), want)
+		e.expect(r, 200, "")
+		if !bytes.Contains(r.body, []byte(want)) || !bytes.Contains(r.body, []byte(wantType)) {
+			t.Fatalf("%s: completion result %s", tc.algo, r.body)
+		}
+		if got := e.do("HEAD", key, nil, "X-Amz-Checksum-Mode", "ENABLED").Header.Get(checksumHeader(tc.algo)); got != want {
+			t.Fatalf("%s: HEAD checksum %q, want %q", tc.algo, got, want)
+		}
+		if got := e.do("GET", key+"?partNumber=2", nil, "X-Amz-Checksum-Mode", "ENABLED").Header.Get(checksumHeader(tc.algo)); got != mps[1].Checksum {
+			t.Fatalf("%s: part 2 checksum %q, want %q", tc.algo, got, mps[1].Checksum)
+		}
+		r = e.do("GET", key+"?attributes", nil, "X-Amz-Object-Attributes", "ETag,Checksum,ObjectParts,ObjectSize")
+		var oa objectAttributesXML
+		xml.Unmarshal(r.body, &oa)
+		if oa.Checksum == nil || oa.Checksum.checksum(tc.algo) != want || oa.ObjectParts == nil || oa.ObjectParts.TotalPartsCount != 2 ||
+			oa.ObjectSize == nil || *oa.ObjectSize != int64(len(whole)) {
+			t.Fatalf("%s: GetObjectAttributes %s", tc.algo, r.body)
+		}
+	}
+	e.expect(e.do("POST", "/bkt/x?uploads", nil, "X-Amz-Checksum-Algorithm", "SHA256", "X-Amz-Checksum-Type", "FULL_OBJECT"), 400, "InvalidRequest")
 }

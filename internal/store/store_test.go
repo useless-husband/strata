@@ -457,7 +457,7 @@ func TestMultipart(t *testing.T) {
 	ts := newTestStore(t, 2, 1)
 	ts.MakeBucket("bkt")
 	ctx := context.Background()
-	up, err := ts.NewMultipartUpload("bkt", "big", PutOptions{ContentType: "application/x-test", UserMeta: map[string]string{"a": "b"}}, "")
+	up, err := ts.NewMultipartUpload("bkt", "big", PutOptions{ContentType: "application/x-test", UserMeta: map[string]string{"a": "b"}}, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -482,7 +482,7 @@ func TestMultipart(t *testing.T) {
 		t.Fatalf("ListParts = %+v", lp)
 	}
 	complete := func(cps ...CompletePart) error {
-		_, err := ts.CompleteMultipartUpload(ctx, "bkt", "big", up.UploadID, cps, Conditions{})
+		_, err := ts.CompleteMultipartUpload(ctx, "bkt", "big", up.UploadID, cps, CompleteOptions{})
 		return err
 	}
 	cp := func(i int) CompletePart { return CompletePart{Number: i + 1, ETag: `"` + infos[i].ETag + `"`} }
@@ -506,9 +506,14 @@ func TestMultipart(t *testing.T) {
 		o.Info.ContentType != "application/x-test" || o.Info.UserMeta["a"] != "b" {
 		t.Fatalf("info %+v", o.Info)
 	}
-	// The upload is gone and the parts were moved, not copied.
-	if err := complete(cp(0), cp(1), cp(2)); !errors.Is(err, s3err.NoSuchUpload) {
-		t.Fatalf("completing twice: %v", err)
+	// Retrying the same completion gets the same answer, as from S3; a
+	// different part list finds no upload. The parts were moved, not copied.
+	again, err := ts.CompleteMultipartUpload(ctx, "bkt", "big", up.UploadID, []CompletePart{cp(0), cp(1), cp(2)}, CompleteOptions{})
+	if err != nil || again.ETag != o.Info.ETag {
+		t.Fatalf("retried completion: %+v %v", again, err)
+	}
+	if err := complete(cp(0), cp(1)); !errors.Is(err, s3err.NoSuchUpload) {
+		t.Fatalf("completing again with other parts: %v", err)
 	}
 	for _, d := range ts.Store.disks {
 		if entries, _ := os.ReadDir(d.sysPath(multipartDir)); len(entries) != 0 {
@@ -532,10 +537,10 @@ func TestMultipartSmallPartsAndAbort(t *testing.T) {
 	ts := newTestStore(t, 2, 1)
 	ts.MakeBucket("bkt")
 	ctx := context.Background()
-	up, _ := ts.NewMultipartUpload("bkt", "k", PutOptions{}, "")
+	up, _ := ts.NewMultipartUpload("bkt", "k", PutOptions{}, "", "")
 	p1, _ := ts.PutObjectPart(ctx, "bkt", "k", up.UploadID, 1, strings.NewReader("small"), PartOptions{})
 	p2, _ := ts.PutObjectPart(ctx, "bkt", "k", up.UploadID, 2, strings.NewReader("small"), PartOptions{})
-	_, err := ts.CompleteMultipartUpload(ctx, "bkt", "k", up.UploadID, []CompletePart{{1, p1.ETag}, {2, p2.ETag}}, Conditions{})
+	_, err := ts.CompleteMultipartUpload(ctx, "bkt", "k", up.UploadID, []CompletePart{{Number: 1, ETag: p1.ETag}, {Number: 2, ETag: p2.ETag}}, CompleteOptions{})
 	if !errors.Is(err, s3err.EntityTooSmall) {
 		t.Fatalf("small first part: %v", err)
 	}
@@ -556,9 +561,9 @@ func TestMultipartSmallPartsAndAbort(t *testing.T) {
 		t.Fatalf("after abort: %v", err)
 	}
 	// A single small part is fine.
-	up, _ = ts.NewMultipartUpload("bkt", "k", PutOptions{}, "")
+	up, _ = ts.NewMultipartUpload("bkt", "k", PutOptions{}, "", "")
 	p1, _ = ts.PutObjectPart(ctx, "bkt", "k", up.UploadID, 1, strings.NewReader("small"), PartOptions{})
-	if _, err := ts.CompleteMultipartUpload(ctx, "bkt", "k", up.UploadID, []CompletePart{{1, p1.ETag}}, Conditions{}); err != nil {
+	if _, err := ts.CompleteMultipartUpload(ctx, "bkt", "k", up.UploadID, []CompletePart{{Number: 1, ETag: p1.ETag}}, CompleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	ts.mustGet("bkt", "k", []byte("small"))

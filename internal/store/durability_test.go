@@ -29,7 +29,7 @@ func corpus(t *testing.T, ts *testStore, r *rand.Rand) map[string][]byte {
 		ts.put("bkt", key, objs[key])
 	}
 	ctx := context.Background()
-	up, err := ts.NewMultipartUpload("bkt", "multi/part", PutOptions{}, "")
+	up, err := ts.NewMultipartUpload("bkt", "multi/part", PutOptions{}, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func corpus(t *testing.T, ts *testStore, r *rand.Rand) map[string][]byte {
 		cps = append(cps, CompletePart{Number: i + 1, ETag: p.ETag})
 		whole = append(whole, data...)
 	}
-	if _, err := ts.CompleteMultipartUpload(ctx, "bkt", "multi/part", up.UploadID, cps, Conditions{}); err != nil {
+	if _, err := ts.CompleteMultipartUpload(ctx, "bkt", "multi/part", up.UploadID, cps, CompleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	objs["multi/part"] = whole

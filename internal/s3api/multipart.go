@@ -2,11 +2,13 @@ package s3api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 
+	"github.com/useless-husband/strata/internal/checksum"
 	"github.com/useless-husband/strata/internal/s3err"
 	"github.com/useless-husband/strata/internal/store"
 )
@@ -18,17 +20,29 @@ func (s *Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 	algo := strings.ToUpper(r.Header.Get("X-Amz-Checksum-Algorithm"))
-	if algo != "" && newChecksum(algo) == nil {
+	typ := strings.ToUpper(r.Header.Get("X-Amz-Checksum-Type"))
+	switch {
+	case algo == "" && typ != "":
+		s.writeError(w, r, req, s3err.InvalidRequest.With("The x-amz-checksum-type header can only be used with the x-amz-checksum-algorithm header."))
+		return
+	case algo != "" && !checksum.Valid(algo):
 		s.writeError(w, r, req, s3err.InvalidRequest.With("Checksum algorithm %s is not supported", algo))
 		return
+	case algo != "" && typ == "":
+		typ = checksum.DefaultType(algo)
 	}
-	up, err := s.store.NewMultipartUpload(req.bucket, req.key, opts, algo)
+	if algo != "" && !checksum.TypeAllowed(algo, typ) {
+		s.writeError(w, r, req, s3err.InvalidRequest.With("The %s checksum type cannot be used with the %s checksum algorithm.", typ, algo))
+		return
+	}
+	up, err := s.store.NewMultipartUpload(req.bucket, req.key, opts, algo, typ)
 	if err != nil {
 		s.writeError(w, r, req, err)
 		return
 	}
 	if algo != "" {
 		w.Header().Set("X-Amz-Checksum-Algorithm", algo)
+		w.Header().Set("X-Amz-Checksum-Type", typ)
 	}
 	writeXML(w, http.StatusOK, initiateMultipartUploadResult{NS: s3NS, Bucket: req.bucket, Key: req.key, UploadID: up.UploadID})
 }
@@ -97,11 +111,18 @@ func (s *Server) uploadPartCopy(w http.ResponseWriter, r *http.Request, req *req
 	off, length := int64(0), src.Info.Size
 	if v := r.Header.Get("X-Amz-Copy-Source-Range"); v != "" {
 		var ok bool
-		off, length, ok, err = parseRange(v, src.Info.Size)
-		if err != nil || !ok || strings.HasPrefix(strings.TrimPrefix(v, "bytes="), "-") {
+		// Unlike a GET range, a copy range must be explicit and inside
+		// the source object.
+		first, last, ok := parseCopyRange(v)
+		if !ok {
 			s.writeError(w, r, req, s3err.InvalidArgument.With("The x-amz-copy-source-range value must be of the form bytes=first-last where first and last are the zero-based offsets of the first and last bytes to copy"))
 			return
 		}
+		if last >= src.Info.Size {
+			s.writeError(w, r, req, s3err.InvalidRange.With("The requested range is not satisfiable: bytes %d-%d of an object of %d bytes", first, last, src.Info.Size))
+			return
+		}
+		off, length = first, last-first+1
 	}
 	if length > store.MaxPutSize {
 		s.writeError(w, r, req, s3err.InvalidRequest.With("The specified copy range is larger than the maximum part size"))
@@ -126,33 +147,52 @@ func (s *Server) completeMultipartUpload(w http.ResponseWriter, r *http.Request,
 		s.writeError(w, r, req, err)
 		return
 	}
-	if _, err := s.store.GetUpload(req.bucket, req.key, uploadID); err != nil {
+	if _, err := s.store.HeadBucket(req.bucket); err != nil {
 		s.writeError(w, r, req, err)
 		return
 	}
-	data, err := s.readSmallBody(r, req)
+	// The x-amz-checksum-* header of this request is the checksum of the
+	// object being assembled, not of the XML body.
+	data, err := s.readSmallBody(r, req, true)
 	if err != nil {
 		s.writeError(w, r, req, err)
 		return
 	}
 	var cmu completeMultipartUpload
 	if err := readXML(strings.NewReader(string(data)), &cmu); err != nil {
+		if errors.Is(err, s3err.MissingRequestBody) {
+			err = s3err.MalformedXML
+		}
+		s.writeError(w, r, req, err)
+		return
+	}
+	up, err := s.store.GetUpload(req.bucket, req.key, uploadID)
+	if err != nil && !errors.Is(err, s3err.NoSuchUpload) {
 		s.writeError(w, r, req, err)
 		return
 	}
 	parts := make([]store.CompletePart, len(cmu.Parts))
 	for i, p := range cmu.Parts {
-		parts[i] = store.CompletePart{Number: p.PartNumber, ETag: trimETag(p.ETag)}
+		parts[i] = store.CompletePart{Number: p.PartNumber, ETag: trimETag(p.ETag), Checksum: p.checksum(up.ChecksumAlgorithm)}
 	}
-	info, err := s.store.CompleteMultipartUpload(r.Context(), req.bucket, req.key, uploadID, parts, cond)
+	opt := store.CompleteOptions{Conditions: cond}
+	if up.ChecksumAlgorithm != "" {
+		opt.Checksum = r.Header.Get(checksumHeader(up.ChecksumAlgorithm))
+	}
+	info, err := s.store.CompleteMultipartUpload(r.Context(), req.bucket, req.key, uploadID, parts, opt)
 	if err != nil {
 		s.writeError(w, r, req, err)
 		return
 	}
-	writeXML(w, http.StatusOK, completeMultipartUploadResult{
+	res := completeMultipartUploadResult{
 		NS: s3NS, Location: fmt.Sprintf("/%s/%s", req.bucket, req.key),
 		Bucket: req.bucket, Key: req.key, ETag: `"` + info.ETag + `"`,
-	})
+	}
+	if info.Checksum != "" {
+		res.setChecksum(info.ChecksumAlgorithm, info.Checksum)
+		res.ChecksumType = info.ChecksumType
+	}
+	writeXML(w, http.StatusOK, res)
 }
 
 func (s *Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, req *request) {
@@ -187,9 +227,16 @@ func (s *Server) listParts(w http.ResponseWriter, r *http.Request, req *request)
 	out := listPartsResult{NS: s3NS, Bucket: req.bucket, Key: req.key, UploadID: uploadID, Initiator: own, Owner: own,
 		StorageClass: "STANDARD", PartNumberMarker: marker, NextPartNumberMarker: res.NextPartNumberMarker,
 		MaxParts: maxParts, IsTruncated: res.IsTruncated}
+	up, _ := s.store.GetUpload(req.bucket, req.key, uploadID)
+	if up.ChecksumAlgorithm != "" {
+		out.ChecksumAlgorithm, out.ChecksumType = up.ChecksumAlgorithm, up.ChecksumType
+	}
 	for i, p := range res.Parts {
-		out.Parts = append(out.Parts, partXML{PartNumber: p.Number, LastModified: iso8601(res.ModTimes[i]),
-			ETag: `"` + p.ETag + `"`, Size: p.Size})
+		px := partXML{PartNumber: p.Number, LastModified: iso8601(res.ModTimes[i]), ETag: `"` + p.ETag + `"`, Size: p.Size}
+		if p.Checksum != "" {
+			px.setChecksum(up.ChecksumAlgorithm, p.Checksum)
+		}
+		out.Parts = append(out.Parts, px)
 	}
 	writeXML(w, http.StatusOK, out)
 }
@@ -225,4 +272,22 @@ func (s *Server) listMultipartUploads(w http.ResponseWriter, r *http.Request, re
 		out.CommonPrefixes = append(out.CommonPrefixes, commonPrefixXML{Prefix: encode(p)})
 	}
 	writeXML(w, http.StatusOK, out)
+}
+
+// parseCopyRange parses x-amz-copy-source-range: "bytes=first-last".
+func parseCopyRange(v string) (first, last int64, ok bool) {
+	spec, found := strings.CutPrefix(strings.TrimSpace(v), "bytes=")
+	if !found {
+		return 0, 0, false
+	}
+	a, b, found := strings.Cut(spec, "-")
+	if !found {
+		return 0, 0, false
+	}
+	first, err1 := strconv.ParseInt(a, 10, 64)
+	last, err2 := strconv.ParseInt(b, 10, 64)
+	if err1 != nil || err2 != nil || first < 0 || last < first {
+		return 0, 0, false
+	}
+	return first, last, true
 }

@@ -31,15 +31,18 @@ type errorResponse struct {
 }
 
 type listAllMyBucketsResult struct {
-	XMLName xml.Name    `xml:"ListAllMyBucketsResult"`
-	NS      string      `xml:"xmlns,attr"`
-	Owner   owner       `xml:"Owner"`
-	Buckets []bucketXML `xml:"Buckets>Bucket"`
+	XMLName           xml.Name    `xml:"ListAllMyBucketsResult"`
+	NS                string      `xml:"xmlns,attr"`
+	Owner             owner       `xml:"Owner"`
+	Buckets           []bucketXML `xml:"Buckets>Bucket"`
+	ContinuationToken string      `xml:"ContinuationToken,omitempty"`
+	Prefix            string      `xml:"Prefix,omitempty"`
 }
 
 type bucketXML struct {
 	Name         string `xml:"Name"`
 	CreationDate string `xml:"CreationDate"`
+	BucketRegion string `xml:"BucketRegion,omitempty"`
 }
 
 type objectXML struct {
@@ -60,7 +63,7 @@ type listBucketResultV2 struct {
 	NS                    string            `xml:"xmlns,attr"`
 	Name                  string            `xml:"Name"`
 	Prefix                string            `xml:"Prefix"`
-	ContinuationToken     string            `xml:"ContinuationToken,omitempty"`
+	ContinuationToken     *string           `xml:"ContinuationToken"`
 	NextContinuationToken string            `xml:"NextContinuationToken,omitempty"`
 	StartAfter            string            `xml:"StartAfter,omitempty"`
 	KeyCount              int               `xml:"KeyCount"`
@@ -152,6 +155,7 @@ type deleteRequest struct {
 	Objects []struct {
 		Key       string `xml:"Key"`
 		VersionID string `xml:"VersionId"`
+		ETag      string `xml:"ETag"` // delete only if it matches
 	} `xml:"Object"`
 }
 
@@ -181,11 +185,47 @@ type initiateMultipartUploadResult struct {
 	UploadID string   `xml:"UploadId"`
 }
 
+// checksumsXML are the Checksum<ALGO> elements of parts and results.
+type checksumsXML struct {
+	ChecksumCRC32     string `xml:"ChecksumCRC32,omitempty"`
+	ChecksumCRC32C    string `xml:"ChecksumCRC32C,omitempty"`
+	ChecksumCRC64NVME string `xml:"ChecksumCRC64NVME,omitempty"`
+	ChecksumSHA1      string `xml:"ChecksumSHA1,omitempty"`
+	ChecksumSHA256    string `xml:"ChecksumSHA256,omitempty"`
+}
+
+func (c *checksumsXML) setChecksum(algo, v string) {
+	switch algo {
+	case "CRC32":
+		c.ChecksumCRC32 = v
+	case "CRC32C":
+		c.ChecksumCRC32C = v
+	case "CRC64NVME":
+		c.ChecksumCRC64NVME = v
+	case "SHA1":
+		c.ChecksumSHA1 = v
+	case "SHA256":
+		c.ChecksumSHA256 = v
+	}
+}
+
+// checksum returns the value for algo, or the only value given if algo is
+// empty.
+func (c *checksumsXML) checksum(algo string) string {
+	all := map[string]string{"CRC32": c.ChecksumCRC32, "CRC32C": c.ChecksumCRC32C, "CRC64NVME": c.ChecksumCRC64NVME,
+		"SHA1": c.ChecksumSHA1, "SHA256": c.ChecksumSHA256}
+	if algo != "" {
+		return all[algo]
+	}
+	return ""
+}
+
 type completeMultipartUpload struct {
 	XMLName xml.Name `xml:"CompleteMultipartUpload"`
 	Parts   []struct {
 		PartNumber int    `xml:"PartNumber"`
 		ETag       string `xml:"ETag"`
+		checksumsXML
 	} `xml:"Part"`
 }
 
@@ -196,6 +236,8 @@ type completeMultipartUploadResult struct {
 	Bucket   string   `xml:"Bucket"`
 	Key      string   `xml:"Key"`
 	ETag     string   `xml:"ETag"`
+	checksumsXML
+	ChecksumType string `xml:"ChecksumType,omitempty"`
 }
 
 type partXML struct {
@@ -203,6 +245,7 @@ type partXML struct {
 	LastModified string `xml:"LastModified"`
 	ETag         string `xml:"ETag"`
 	Size         int64  `xml:"Size"`
+	checksumsXML
 }
 
 type listPartsResult struct {
@@ -218,6 +261,8 @@ type listPartsResult struct {
 	NextPartNumberMarker int       `xml:"NextPartNumberMarker"`
 	MaxParts             int       `xml:"MaxParts"`
 	IsTruncated          bool      `xml:"IsTruncated"`
+	ChecksumAlgorithm    string    `xml:"ChecksumAlgorithm,omitempty"`
+	ChecksumType         string    `xml:"ChecksumType,omitempty"`
 	Parts                []partXML `xml:"Part"`
 }
 
@@ -296,4 +341,34 @@ func writeXML(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	w.Write([]byte(xml.Header))
 	w.Write(out)
+}
+
+type objectAttributesXML struct {
+	XMLName      xml.Name        `xml:"GetObjectAttributesResponse"`
+	NS           string          `xml:"xmlns,attr"`
+	ETag         string          `xml:"ETag,omitempty"`
+	Checksum     *checksumAttrs  `xml:"Checksum,omitempty"`
+	ObjectParts  *objectPartsXML `xml:"ObjectParts,omitempty"`
+	StorageClass string          `xml:"StorageClass,omitempty"`
+	ObjectSize   *int64          `xml:"ObjectSize,omitempty"`
+}
+
+type checksumAttrs struct {
+	checksumsXML
+	ChecksumType string `xml:"ChecksumType,omitempty"`
+}
+
+type objectPartsXML struct {
+	TotalPartsCount      int             `xml:"PartsCount"`
+	PartNumberMarker     int             `xml:"PartNumberMarker"`
+	NextPartNumberMarker int             `xml:"NextPartNumberMarker"`
+	MaxParts             int             `xml:"MaxParts"`
+	IsTruncated          bool            `xml:"IsTruncated"`
+	Parts                []objectPartXML `xml:"Part"`
+}
+
+type objectPartXML struct {
+	PartNumber int   `xml:"PartNumber"`
+	Size       int64 `xml:"Size"`
+	checksumsXML
 }

@@ -2,6 +2,7 @@ package s3api
 
 import (
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -12,10 +13,44 @@ import (
 	"github.com/useless-husband/strata/internal/store"
 )
 
+// listBuckets implements ListBuckets, with the optional max-buckets,
+// continuation-token, prefix and bucket-region parameters.
 func (s *Server) listBuckets(w http.ResponseWriter, r *http.Request, req *request) {
-	res := listAllMyBucketsResult{NS: s3NS, Owner: ownerFor(req.auth.AccessKey)}
+	q := r.URL.Query()
+	maxBuckets := 10000
+	if v := q.Get("max-buckets"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 10000 {
+			s.writeError(w, r, req, s3err.InvalidArgument.With("max-buckets must be an integer between 1 and 10000"))
+			return
+		}
+		maxBuckets = n
+	}
+	after := ""
+	if t := q.Get("continuation-token"); t != "" {
+		b, err := base64.RawURLEncoding.DecodeString(t)
+		if err != nil {
+			s.writeError(w, r, req, s3err.InvalidArgument.With("The continuation token provided is incorrect"))
+			return
+		}
+		after = string(b)
+	}
+	prefix := q.Get("prefix")
+	res := listAllMyBucketsResult{NS: s3NS, Owner: ownerFor(req.auth.AccessKey), Prefix: prefix}
+	if region := q.Get("bucket-region"); region != "" && region != s.cfg.Region {
+		writeXML(w, http.StatusOK, res)
+		return
+	}
 	for _, b := range s.store.ListBuckets() {
-		res.Buckets = append(res.Buckets, bucketXML{Name: b.Name, CreationDate: iso8601(b.Created)})
+		if b.Name <= after || !strings.HasPrefix(b.Name, prefix) {
+			continue
+		}
+		if len(res.Buckets) == maxBuckets {
+			last := res.Buckets[len(res.Buckets)-1].Name
+			res.ContinuationToken = base64.RawURLEncoding.EncodeToString([]byte(last))
+			break
+		}
+		res.Buckets = append(res.Buckets, bucketXML{Name: b.Name, CreationDate: iso8601(b.Created), BucketRegion: s.cfg.Region})
 	}
 	writeXML(w, http.StatusOK, res)
 }
@@ -56,8 +91,12 @@ func (s *Server) createBucket(w http.ResponseWriter, r *http.Request, req *reque
 		}
 	}
 	if err := s.store.MakeBucket(req.bucket); err != nil {
-		s.writeError(w, r, req, err)
-		return
+		// In us-east-1, S3 answers 200 to re-creating a bucket you own
+		// (and leaves it as it is); elsewhere it is an error.
+		if !(errors.Is(err, s3err.BucketAlreadyOwnedByYou) && s.cfg.Region == "us-east-1") {
+			s.writeError(w, r, req, err)
+			return
+		}
 	}
 	w.Header().Set("Location", "/"+req.bucket)
 	w.WriteHeader(http.StatusOK)
@@ -179,7 +218,7 @@ func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, req *requ
 	}
 	opt := store.ListOptions{Prefix: q.Get("prefix"), Delimiter: q.Get("delimiter"), After: q.Get("start-after"), MaxKeys: maxKeys}
 	token := q.Get("continuation-token")
-	if q.Has("continuation-token") {
+	if token != "" {
 		after, err := base64.RawURLEncoding.DecodeString(token)
 		if err != nil || len(after) == 0 {
 			s.writeError(w, r, req, s3err.InvalidArgument.With("The continuation token provided is incorrect"))
@@ -195,8 +234,11 @@ func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, req *requ
 	out := listBucketResultV2{
 		NS: s3NS, Name: req.bucket, Prefix: encode(opt.Prefix), MaxKeys: maxKeys,
 		Delimiter: encode(opt.Delimiter), EncodingType: enc, IsTruncated: res.IsTruncated,
-		ContinuationToken: token, StartAfter: encode(q.Get("start-after")),
-		KeyCount: len(res.Objects) + len(res.CommonPrefixes),
+		StartAfter: encode(q.Get("start-after")),
+		KeyCount:   len(res.Objects) + len(res.CommonPrefixes),
+	}
+	if q.Has("continuation-token") {
+		out.ContinuationToken = &token // echoed even when empty
 	}
 	if res.IsTruncated {
 		out.NextContinuationToken = base64.RawURLEncoding.EncodeToString([]byte(res.NextMarker))
@@ -234,8 +276,10 @@ func (s *Server) listObjectsV1(w http.ResponseWriter, r *http.Request, req *requ
 		s.writeError(w, r, req, err)
 		return
 	}
+	// With encoding-type=url S3 encodes Marker, NextMarker, Delimiter and
+	// the keys of a v1 listing, but not Prefix (clients decode accordingly).
 	out := listBucketResultV1{
-		NS: s3NS, Name: req.bucket, Prefix: encode(opt.Prefix), Marker: encode(opt.After), MaxKeys: maxKeys,
+		NS: s3NS, Name: req.bucket, Prefix: opt.Prefix, Marker: encode(opt.After), MaxKeys: maxKeys,
 		Delimiter: encode(opt.Delimiter), EncodingType: enc, IsTruncated: res.IsTruncated,
 	}
 	// S3 returns NextMarker only when a delimiter is given; without one,
@@ -300,7 +344,7 @@ func (s *Server) deleteObjects(w http.ResponseWriter, r *http.Request, req *requ
 		s.writeError(w, r, req, err)
 		return
 	}
-	body, err := s.readSmallBody(r, req)
+	body, err := s.readSmallBody(r, req, false)
 	if err != nil {
 		s.writeError(w, r, req, err)
 		return
@@ -323,7 +367,7 @@ func (s *Server) deleteObjects(w http.ResponseWriter, r *http.Request, req *requ
 		case len(o.Key) > store.MaxKeyLength:
 			err = s3err.KeyTooLong
 		default:
-			err = s.store.DeleteObject(req.bucket, o.Key)
+			err = s.store.DeleteObjectIf(req.bucket, o.Key, trimETag(o.ETag))
 		}
 		if err != nil {
 			e := s3err.From(err)

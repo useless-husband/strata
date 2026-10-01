@@ -235,7 +235,7 @@ func (s *Server) splitPath(r *http.Request) (bucket, key string) {
 var unsupported = []string{"policy", "cors", "lifecycle", "tagging", "website", "logging", "notification",
 	"replication", "encryption", "object-lock", "retention", "legal-hold", "requestPayment", "accelerate",
 	"inventory", "analytics", "metrics", "intelligent-tiering", "ownershipControls", "publicAccessBlock",
-	"torrent", "restore", "select", "attributes", "policyStatus", "renameObject"}
+	"torrent", "restore", "select", "policyStatus", "renameObject"}
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request, req *request) {
 	if strings.HasPrefix(r.URL.Path, "/-/") {
@@ -351,6 +351,9 @@ func (s *Server) routeObject(w http.ResponseWriter, r *http.Request, req *reques
 		case q.Has("acl"):
 			req.api = "GetObjectAcl"
 			s.getACL(w, r, req)
+		case q.Has("attributes"):
+			req.api = "GetObjectAttributes"
+			s.getObjectAttributes(w, r, req)
 		default:
 			req.api = "GetObject"
 			s.getObject(w, r, req, false)

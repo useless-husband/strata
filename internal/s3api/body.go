@@ -1,59 +1,34 @@
 package s3api
 
 import (
-	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"hash"
-	"hash/crc32"
-	"hash/crc64"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 
+	"github.com/useless-husband/strata/internal/checksum"
 	"github.com/useless-husband/strata/internal/s3err"
 	"github.com/useless-husband/strata/internal/sigv4"
 	"github.com/useless-husband/strata/internal/store"
 )
 
-// Checksum algorithms of the x-amz-checksum-* headers.
-var checksumAlgorithms = []string{"CRC32", "CRC32C", "CRC64NVME", "SHA1", "SHA256"}
+func newChecksum(algo string) hash.Hash { return checksum.New(algo) }
 
-// crc64NVME is CRC-64/NVME (polynomial 0xad93d23594c93659, reflected),
-// the default checksum of current AWS SDKs. hash/crc64 implements the
-// reflected algorithm with init and final XOR of all ones, so only the
-// table needs the bit-reversed polynomial.
-var crc64NVME = crc64.MakeTable(0x9a6c9329ac4bc9b5)
-
-var castagnoli = crc32.MakeTable(crc32.Castagnoli)
-
-func newChecksum(algo string) hash.Hash {
-	switch algo {
-	case "CRC32":
-		return crc32.NewIEEE()
-	case "CRC32C":
-		return crc32.New(castagnoli)
-	case "CRC64NVME":
-		return crc64.New(crc64NVME)
-	case "SHA1":
-		return sha1.New()
-	case "SHA256":
-		return sha256.New()
-	}
-	return nil
-}
-
-func checksumHeader(algo string) string { return "x-amz-checksum-" + strings.ToLower(algo) }
+func checksumHeader(algo string) string { return checksum.Header(algo) }
 
 // requestChecksum works out which checksum the client sent, if any: named
 // in x-amz-trailer (value arrives after the body) or present as a header.
+// A value that is not a checksum at all fails the comparison at the end
+// of the body like a wrong one does (BadDigest, as S3 answers).
 func requestChecksum(r *http.Request) (algo, value string, trailer bool, err error) {
 	if t := r.Header.Get("X-Amz-Trailer"); t != "" {
 		for _, name := range strings.Split(t, ",") {
 			name = strings.ToLower(strings.TrimSpace(name))
-			for _, a := range checksumAlgorithms {
+			for _, a := range checksum.Algorithms {
 				if name == checksumHeader(a) {
 					return a, "", true, nil
 				}
@@ -61,7 +36,7 @@ func requestChecksum(r *http.Request) (algo, value string, trailer bool, err err
 		}
 		return "", "", false, s3err.InvalidRequest.With("The value specified in the x-amz-trailer header is not supported")
 	}
-	for _, a := range checksumAlgorithms {
+	for _, a := range checksum.Algorithms {
 		if v := r.Header.Get(checksumHeader(a)); v != "" {
 			if algo != "" {
 				return "", "", false, s3err.InvalidRequest.With("Expecting a single x-amz-checksum- header. Multiple checksum Types are not allowed.")
@@ -69,24 +44,7 @@ func requestChecksum(r *http.Request) (algo, value string, trailer bool, err err
 			algo, value = a, v
 		}
 	}
-	if algo != "" {
-		if want := checksumLen(algo); len(value) != base64.StdEncoding.EncodedLen(want) {
-			return "", "", false, s3err.InvalidRequest.With("Value for %s header is invalid.", checksumHeader(algo))
-		}
-	}
 	return algo, value, false, nil
-}
-
-func checksumLen(algo string) int {
-	switch algo {
-	case "CRC32", "CRC32C":
-		return 4
-	case "CRC64NVME":
-		return 8
-	case "SHA1":
-		return 20
-	}
-	return 32
 }
 
 func sumBase64(h hash.Hash) string { return base64.StdEncoding.EncodeToString(h.Sum(nil)) }
@@ -132,7 +90,9 @@ func newBodyReader(r *http.Request, auth *sigv4.Auth) (*bodyReader, error) {
 			b.wantSHA = auth.PayloadHash
 		}
 	}
-	if b.size < 0 {
+	// HTTP chunked transfer encoding (not aws-chunked) has no length up
+	// front; accept it and count, within the size limits of the store.
+	if b.size < 0 && !(len(r.TransferEncoding) > 0 && r.TransferEncoding[0] == "chunked") {
 		return nil, s3err.MissingContentLength
 	}
 	algo, value, fromTrailer, err := requestChecksum(r)
@@ -155,7 +115,7 @@ func (b *bodyReader) Read(p []byte) (int, error) {
 	n, err := b.r.Read(p)
 	if n > 0 {
 		b.n += int64(n)
-		if b.n > b.size {
+		if b.size >= 0 && b.n > b.size {
 			b.err = s3err.IncompleteBody.With("The request body is longer than its declared length")
 			return 0, b.err
 		}
@@ -181,7 +141,7 @@ func (b *bodyReader) Read(p []byte) (int, error) {
 
 // finish runs the end-of-stream checks.
 func (b *bodyReader) finish() error {
-	if b.n != b.size {
+	if b.size >= 0 && b.n != b.size {
 		return s3err.IncompleteBody
 	}
 	if b.sha != nil && hex.EncodeToString(b.sha.Sum(nil)) != b.wantSHA {

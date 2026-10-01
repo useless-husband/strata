@@ -571,6 +571,13 @@ func (s *Store) dropData(bucket, key, version string, removeDir bool) {
 // DeleteObject removes a key. Deleting a key that does not exist succeeds,
 // as in S3.
 func (s *Store) DeleteObject(bucketName, key string) error {
+	return s.DeleteObjectIf(bucketName, key, "")
+}
+
+// DeleteObjectIf removes a key if its ETag matches ifMatch ("" for any,
+// "*" for any existing). As in S3, a conditional delete of a key that does
+// not exist succeeds.
+func (s *Store) DeleteObjectIf(bucketName, key, ifMatch string) error {
 	b, err := s.getBucket(bucketName)
 	if err != nil {
 		return err
@@ -586,6 +593,9 @@ func (s *Store) DeleteObject(bucketName, key string) error {
 	cur, ok := b.index.get(key)
 	if !ok {
 		return nil
+	}
+	if ifMatch != "" && ifMatch != "*" && ifMatch != cur.etag {
+		return s3err.PreconditionFailed
 	}
 	// Remove the metadata from a write quorum of disks first, so the
 	// version can never again be found on k disks.
