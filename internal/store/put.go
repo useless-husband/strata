@@ -190,29 +190,16 @@ func (s *Store) encodeInline(st *stage, data []byte, dist []int) []byte {
 	return sum[:]
 }
 
-var bufPool sync.Pool // *[]byte of blockSize
-
-func (s *Store) getBlockBuf() *[]byte {
-	if b, ok := bufPool.Get().(*[]byte); ok && cap(*b) >= s.cfg.BlockSize {
-		return b
-	}
-	b := make([]byte, s.cfg.BlockSize)
-	return &b
-}
-
 // writePart reads body to EOF, erasure-codes it stripe by stripe and writes
 // shard file "data/part.<number>" on every live disk of the stage. It
 // returns the size and MD5 of what it read. limit caps the size.
+//
+// Writing is pipelined: one goroutine per disk writes its blocks while the
+// caller reads and encodes the next stripe, using a ring of stripe buffers
+// so that no buffer is reused before every disk has written it.
 func (s *Store) writePart(ctx context.Context, st *stage, number int, body io.Reader, dist []int, limit int64) (int64, []byte, error) {
 	name := "part." + strconv.Itoa(number)
 	files := make([]*os.File, s.n)
-	defer func() {
-		for _, f := range files {
-			if f != nil {
-				f.Close()
-			}
-		}
-	}()
 	for d := range s.disks {
 		if !st.alive[d] {
 			continue
@@ -224,53 +211,118 @@ func (s *Store) writePart(ctx context.Context, st *stage, number int, body io.Re
 		}
 		files[d] = f
 	}
+	defer func() {
+		for _, f := range files {
+			if f != nil {
+				f.Close()
+			}
+		}
+	}()
 	if st.count() < s.writeQuorum {
 		return 0, nil, errWriteQuorum(st.count(), s.writeQuorum)
 	}
 
-	bufp := s.getBlockBuf()
-	defer bufPool.Put(bufp)
-	data := (*bufp)[:s.cfg.BlockSize]
+	// Per-disk writers. A failed disk keeps consuming (and discarding) its
+	// queue so the pipeline never stalls.
+	type stripeBuf struct {
+		data []byte
+		out  [][]byte // checksummed block for each disk
+		wg   sync.WaitGroup
+	}
+	const ring = 3
+	bufs := make([]*stripeBuf, ring)
+	for i := range bufs {
+		bufs[i] = &stripeBuf{data: make([]byte, s.cfg.BlockSize), out: make([][]byte, s.n)}
+	}
+	queues := make([]chan *stripeBuf, s.n)
+	werrs := make([]error, s.n)
+	var writers sync.WaitGroup
+	for d, f := range files {
+		if f == nil {
+			continue
+		}
+		queues[d] = make(chan *stripeBuf, ring)
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			for sb := range queues[d] {
+				if werrs[d] == nil {
+					if _, err := f.Write(sb.out[d]); err != nil {
+						werrs[d] = err
+					}
+				}
+				sb.wg.Done()
+			}
+		}()
+	}
+	stopWriters := func() {
+		for _, q := range queues {
+			if q != nil {
+				close(q)
+			}
+		}
+		writers.Wait()
+		for d, err := range werrs {
+			if err != nil {
+				st.fail(d, err)
+			}
+		}
+	}
+
 	shards := make([][]byte, s.n)
-	out := make([][]byte, s.n)
 	h := md5.New()
 	var size, stripe int64
-	for {
+	var rerr error
+	for i := 0; ; i++ {
 		if err := ctx.Err(); err != nil {
+			stopWriters()
 			return 0, nil, err
 		}
-		nr, rerr := io.ReadFull(body, data)
+		sb := bufs[i%ring]
+		sb.wg.Wait() // every disk is done with this buffer's last stripe
+		var nr int
+		nr, rerr = io.ReadFull(body, sb.data)
 		if nr > 0 {
 			size += int64(nr)
 			if size > limit {
+				stopWriters()
 				return 0, nil, s3err.EntityTooLarge
 			}
-			h.Write(data[:nr])
-			shards = s.codec.Split(data[:nr], shards)
+			h.Write(sb.data[:nr])
+			shards = s.codec.Split(sb.data[:nr], shards)
 			if err := s.codec.Encode(shards); err != nil {
+				stopWriters()
 				return 0, nil, err
 			}
-			for d, f := range files {
-				if f == nil || !st.alive[d] {
+			for d := range s.disks {
+				if queues[d] == nil {
 					continue
 				}
 				idx := dist[d]
-				out[d] = appendBlock(out[d][:0], stripe, idx, shards[idx])
-				if _, err := f.Write(out[d]); err != nil {
-					st.fail(d, err)
-				}
+				sb.out[d] = appendBlock(sb.out[d][:0], stripe, idx, shards[idx])
+				sb.wg.Add(1)
 			}
-			if st.count() < s.writeQuorum {
-				return 0, nil, errWriteQuorum(st.count(), s.writeQuorum)
+			for _, q := range queues {
+				if q != nil {
+					q <- sb
+				}
 			}
 			stripe++
 		}
 		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
+			rerr = nil
 			break
 		}
 		if rerr != nil {
-			return 0, nil, rerr
+			break
 		}
+	}
+	stopWriters()
+	if rerr != nil {
+		return 0, nil, rerr
+	}
+	if st.count() < s.writeQuorum {
+		return 0, nil, errWriteQuorum(st.count(), s.writeQuorum)
 	}
 	// Push the shard data to the drives; the flush before the commit
 	// renames makes it durable.
