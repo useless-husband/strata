@@ -371,3 +371,39 @@ func TestInlineCorruptDataShardUsesParity(t *testing.T) {
 		ts.deepClean(fmt.Sprintf("%d+2 after healing rotted inline data shards", k))
 	}
 }
+
+// TestHealRacingDeleteIsNotLoss deletes (or overwrites) a damaged object
+// while it is being healed: the heal must step aside, not report the
+// object lost.
+func TestHealRacingDeleteIsNotLoss(t *testing.T) {
+	for _, size := range []int{1000, 300_000} { // inline and in files
+		for _, overwrite := range []bool{false, true} {
+			ts := newTestStore(t, 2, 1, func(c *Config) { c.BlockSize = 4096 })
+			ts.heal.stop() // no background heals in this test
+			ts.Store.heal = nil
+			ts.MakeBucket("bkt")
+			data := randData(rand.New(rand.NewPCG(3, 3)), size)
+			info := ts.put("bkt", "k", data)
+			// Damage disk 0's copy so the heal has work to do.
+			d0 := ts.Store.disks[0].objectDir("bkt", "k")
+			os.Remove(filepath.Join(d0, info.VersionID+metaSuffix))
+			os.RemoveAll(filepath.Join(d0, info.VersionID))
+			healHookAfterSnapshot = func() {
+				if overwrite {
+					ts.put("bkt", "k", []byte("new"))
+				} else if err := ts.DeleteObject("bkt", "k"); err != nil {
+					t.Error(err)
+				}
+			}
+			res, err := ts.HealObject(context.Background(), "bkt", "k", HealOptions{Deep: true})
+			healHookAfterSnapshot = nil
+			if err != nil || res.Lost || ts.Stats().LostObjects != 0 {
+				t.Fatalf("size %d overwrite %v: heal racing a change reported %+v, err %v, lost counter %d",
+					size, overwrite, res, err, ts.Stats().LostObjects)
+			}
+			if overwrite {
+				ts.mustGet("bkt", "k", []byte("new"))
+			}
+		}
+	}
+}

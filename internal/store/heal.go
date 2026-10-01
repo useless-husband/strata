@@ -117,6 +117,10 @@ func (v dirView) newestWithQuorum(q int) *ObjectMeta {
 
 // --- Healing one object ---
 
+// healHookAfterSnapshot, if set (by tests), runs after a heal has taken its
+// snapshot and released the key lock.
+var healHookAfterSnapshot func()
+
 // HealOptions controls HealObject.
 type HealOptions struct {
 	// Deep reads and verifies every block; otherwise only metadata and
@@ -155,12 +159,11 @@ func (s *Store) HealObject(ctx context.Context, bucketName, key string, opt Heal
 	defer hl.Unlock()
 	lk := s.locks.get(bucketName, key)
 
-	// Phase A: snapshot the index and the disks.
+	// Phase A: snapshot the index and the disks, and lease the version
+	// before anyone can delete it.
 	lk.RLock()
 	cur, exists := b.index.get(key)
 	view := s.readObjectDir(bucketName, key)
-	lk.RUnlock()
-
 	var meta *ObjectMeta
 	if cand := view.newestWithQuorum(s.k); cand != nil && (!exists || cand.ModTime > cur.modTime) {
 		// Only possible after a disk that was offline at start-up comes
@@ -168,17 +171,37 @@ func (s *Store) HealObject(ctx context.Context, bucketName, key string, opt Heal
 		meta, res.Promoted = cand, true
 	} else if exists {
 		meta = view.anyMeta(cur.versionID)
-		if meta == nil {
-			res.VersionID, res.Lost = cur.versionID, true
-			s.stats.lostObjects.Add(1)
-			return res, nil
-		}
-	} else {
+	}
+	var release func()
+	if meta != nil {
+		release = s.leases.acquire(meta.VersionID)
+	}
+	lk.RUnlock()
+	switch {
+	case meta == nil && exists:
+		res.VersionID, res.Lost = cur.versionID, true
+		s.stats.lostObjects.Add(1)
+		return res, nil
+	case meta == nil:
 		return res, nil
 	}
-	res.VersionID = meta.VersionID
-	release := s.leases.acquire(meta.VersionID)
 	defer release()
+	res.VersionID = meta.VersionID
+	if healHookAfterSnapshot != nil {
+		healHookAfterSnapshot()
+	}
+	// stillCurrent reports whether the version being healed is still the
+	// one to keep. A delete or overwrite during the heal removes metadata
+	// (and inline data) at once, which must not be mistaken for damage.
+	stillCurrent := func() bool {
+		lk.RLock()
+		defer lk.RUnlock()
+		now, ok := b.index.get(key)
+		if res.Promoted {
+			return !ok || now.modTime < meta.ModTime
+		}
+		return ok && now.versionID == meta.VersionID
+	}
 
 	// Phase B: find damaged copies and rebuild them, without the lock.
 	bad := make([]bool, s.n)
@@ -195,6 +218,10 @@ func (s *Store) HealObject(ctx context.Context, bucketName, key string, opt Heal
 	}
 	if err := ctx.Err(); err != nil {
 		return res, err
+	}
+	if anyBad && !stillCurrent() {
+		res.BadDisks, res.Skipped = nil, true
+		return res, nil
 	}
 	stale := s.staleVersions(view, meta)
 	if (!anyBad && len(stale) == 0 && !res.Promoted) || opt.DryRun {
@@ -215,6 +242,10 @@ func (s *Store) HealObject(ctx context.Context, bucketName, key string, opt Heal
 		lost, err := s.rebuild(ctx, meta, st, &res)
 		if err != nil {
 			return res, err
+		}
+		if lost && !stillCurrent() {
+			res.BadDisks, res.Skipped = nil, true
+			return res, nil
 		}
 		if lost {
 			res.Lost = true

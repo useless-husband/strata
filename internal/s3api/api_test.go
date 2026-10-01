@@ -860,6 +860,7 @@ func TestS3BehavioursFromConformanceSuite(t *testing.T) {
 		t.Fatalf("partNumber=1 of a single-part object: %d %q", r.StatusCode, r.body)
 	}
 	e.expect(e.do("GET", "/bkt/single?partNumber=2", nil), 400, "InvalidPart")
+	e.expect(e.do("GET", "/bkt/single?partNumber=1", nil, "Range", "bytes=0-1"), 400, "InvalidRequest")
 
 	// An empty continuation token is no token, and is echoed.
 	r = e.do("GET", "/bkt?list-type=2&continuation-token=", nil)

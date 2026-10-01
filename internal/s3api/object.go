@@ -351,6 +351,10 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request, req *request,
 	if multipart {
 		h.Set("X-Amz-Mp-Parts-Count", strconv.Itoa(len(info.Parts)))
 	}
+	if q.Get("partNumber") != "" && r.Header.Get("Range") != "" {
+		s.writeError(w, r, req, s3err.InvalidRequest.With("Cannot specify both Range header and partNumber query parameter"))
+		return
+	}
 	if pn := q.Get("partNumber"); pn != "" {
 		num, err := strconv.Atoi(pn)
 		if err != nil || num < 1 || num > store.MaxPartNumber {

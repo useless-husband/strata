@@ -446,21 +446,26 @@ func (s *Store) DeleteBucket(name string) error {
 		return err
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.index.len() > 0 {
+		b.mu.Unlock()
 		return s3err.BucketNotEmpty
-	}
-	for _, u := range s.uploads.forBucket(name) {
-		s.abortUpload(u)
 	}
 	ok := s.onDisks(func(d *disk) error { return d.removeAll(d.bucketPath(name)) })
 	if ok < s.writeQuorum {
+		b.mu.Unlock()
 		return errWriteQuorum(ok, s.writeQuorum)
 	}
 	b.deleted = true
 	s.mu.Lock()
 	delete(s.buckets, name)
 	s.mu.Unlock()
+	b.mu.Unlock()
+	// Abort the bucket's uploads only now: a completion holds its upload
+	// while it waits for the bucket, so taking an upload while holding the
+	// bucket would deadlock. Completions still waiting find the bucket gone.
+	for _, u := range s.uploads.forBucket(name) {
+		s.abortUpload(u)
+	}
 	return nil
 }
 

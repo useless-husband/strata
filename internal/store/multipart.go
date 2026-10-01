@@ -437,6 +437,9 @@ func (s *Store) CompleteMultipartUpload(ctx context.Context, bucketName, key, up
 	if st.count() < s.writeQuorum {
 		return ObjectInfo{}, errWriteQuorum(st.count(), s.writeQuorum)
 	}
+	if completeHookBeforeCommit != nil {
+		completeHookBeforeCommit()
+	}
 	info, err := s.commit(b, meta, st, opt.Conditions)
 	if err != nil {
 		return ObjectInfo{}, err
@@ -447,6 +450,10 @@ func (s *Store) CompleteMultipartUpload(ctx context.Context, bucketName, key, up
 	s.onDisks(func(d *disk) error { return d.removeAll(d.uploadDir(uploadID)) })
 	return info, nil
 }
+
+// completeHookBeforeCommit, if set (by tests), runs while a completion
+// holds its upload, just before committing.
+var completeHookBeforeCommit func()
 
 // AbortMultipartUpload discards an upload and its parts.
 func (s *Store) AbortMultipartUpload(bucket, key, uploadID string) error {

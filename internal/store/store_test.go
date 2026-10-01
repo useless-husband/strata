@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/useless-husband/strata/internal/s3err"
 )
@@ -653,4 +654,37 @@ func TestConcurrentWritersAndReaders(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// TestDeleteBucketDuringCompleteDoesNotDeadlock: a completion holds its
+// upload and then needs the bucket; DeleteBucket holds the bucket and
+// aborts the bucket's uploads. Taken in opposite orders, they deadlocked.
+func TestDeleteBucketDuringCompleteDoesNotDeadlock(t *testing.T) {
+	ts := newTestStore(t, 2, 1)
+	ts.MakeBucket("bkt")
+	ctx := context.Background()
+	up, _ := ts.NewMultipartUpload("bkt", "k", PutOptions{}, "", "")
+	p, _ := ts.PutObjectPart(ctx, "bkt", "k", up.UploadID, 1, strings.NewReader("part"), PartOptions{})
+	deleted := make(chan error, 1)
+	completeHookBeforeCommit = func() {
+		go func() { deleted <- ts.DeleteBucket("bkt") }()
+		time.Sleep(50 * time.Millisecond) // let DeleteBucket take the bucket
+	}
+	defer func() { completeHookBeforeCommit = nil }()
+	done := make(chan error, 1)
+	go func() {
+		_, err := ts.CompleteMultipartUpload(ctx, "bkt", "k", up.UploadID, []CompletePart{{Number: 1, ETag: p.ETag}}, CompleteOptions{})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		// Either order is fine: the object was committed before the
+		// bucket went (then DeleteBucket fails), or the bucket went first.
+		derr := <-deleted
+		if (err == nil) == (derr == nil) {
+			t.Fatalf("complete: %v, delete bucket: %v", err, derr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("CompleteMultipartUpload and DeleteBucket deadlocked")
+	}
 }
