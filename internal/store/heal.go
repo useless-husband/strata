@@ -627,8 +627,9 @@ func (h *healer) work() {
 		h.mu.Lock()
 		h.busy--
 		h.idle.Broadcast()
+		more := len(h.queue) > 0 // read under the lock: enqueue appends concurrently
 		h.mu.Unlock()
-		if len(h.queue) > 0 {
+		if more {
 			select {
 			case h.wake <- struct{}{}:
 			default:
